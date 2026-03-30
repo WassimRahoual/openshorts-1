@@ -317,7 +317,11 @@ async def run_job(job_id, job_data):
                                 fname = os.path.basename(rf)
                                 ready_clips.append({
                                     'video_url': f"/videos/{job_id}/{quote(fname)}",
-                                    'video_title_for_youtube_short': f'Ranking Short #{i+1}',
+                                    'video_title_for_youtube_short': data.get('video_title_for_youtube_short', f'Ranking Short #{i+1}'),
+                                    'video_description_for_tiktok': data.get('video_description_for_tiktok', ''),
+                                    'video_description_for_instagram': data.get('video_description_for_instagram', ''),
+                                    'hashtags_tiktok': data.get('hashtags_tiktok', ''),
+                                    'hashtags_instagram': data.get('hashtags_instagram', ''),
                                 })
                         else:
                             clips = data.get('shorts', [])
