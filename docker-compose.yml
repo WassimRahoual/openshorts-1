@@ -7,6 +7,12 @@ services:
     volumes:
       - .:/app
       - /app/__pycache__
+    deploy:
+      resources:
+        limits:
+          memory: 14g
+        reservations:
+          memory: 4g
     restart: unless-stopped
 
   frontend:

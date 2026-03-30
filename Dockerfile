@@ -21,7 +21,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install FFmpeg, OpenCV dependencies, and Node.js (for yt-dlp JS challenges)
+# Install FFmpeg, OpenCV dependencies, fonts, and Node.js (for yt-dlp JS challenges)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libgl1 \
@@ -30,7 +30,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext6 \
     libxrender1 \
     nodejs \
-    && rm -rf /var/lib/apt/lists/*
+    fonts-liberation \
+    fontconfig \
+    && rm -rf /var/lib/apt/lists/* \
+    && fc-cache -f -v
 
 # Copy virtual env from builder
 COPY --from=builder /opt/venv /opt/venv

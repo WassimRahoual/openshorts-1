@@ -5,7 +5,7 @@ import subprocess
 import argparse
 import re
 import sys
-from scenedetect import VideoManager, SceneManager
+from scenedetect import VideoManager, SceneManager, open_video
 from scenedetect.detectors import ContentDetector
 from ultralytics import YOLO
 import torch
@@ -61,7 +61,135 @@ OUTPUT — RETURN ONLY VALID JSON (no markdown, no comments). Order clips by pre
       "video_description_for_tiktok": "<description for TikTok oriented to get views>",
       "video_description_for_instagram": "<description for Instagram oriented to get views>",
       "video_title_for_youtube_short": "<title for YouTube Short oriented to get views 100 chars max>",
-      "viral_hook_text": "<SHORT punchy text overlay (max 10 words). MUST BE IN THE SAME LANGUAGE AS THE VIDEO TRANSCRIPT. Examples: 'POV: You realized...', 'Did you know?', 'Stop doing this!'>"
+      "viral_hook_text": "<SHORT punchy text overlay (max 10 words). MUST BE IN THE SAME LANGUAGE AS THE VIDEO TRANSCRIPT. Examples: 'POV: You realized...', 'Did you know?', 'Stop doing this!'>",
+      "hashtags_tiktok": "<8-12 hashtags for TikTok separated by spaces. Mix of: 2-3 high-volume trending hashtags (e.g. #fyp #viral #pourtoi), 3-4 niche topic hashtags, 2-3 mid-volume discovery hashtags. MUST start with #. MUST BE IN THE SAME LANGUAGE AS THE VIDEO (except universal ones like #fyp). Example: #fyp #viral #cybersecurity #hacking #telegram #darkweb #pourtoi #tech>",
+      "hashtags_instagram": "<8-12 hashtags for Instagram Reels separated by spaces. Mix of: 2-3 high-volume hashtags (e.g. #reels #explore #trending), 3-4 niche topic hashtags, 2-3 community hashtags. MUST start with #. MUST BE IN THE SAME LANGUAGE AS THE VIDEO (except universal ones like #reels). Example: #reels #explore #cybersecurite #hacking #telegram #darkweb #tech #infosec>"
+    }}
+  ]
+}}
+"""
+
+GEMINI_RANKING_PROMPT_TEMPLATE = """
+WATCH THE VIDEO CAREFULLY. You are selecting the {num_clips} FUNNIEST clips from this fail compilation for a "TOP {num_clips}" ranking Short.
+
+You can SEE the video. Use your EYES to find the funniest moments — people falling, crashing, animals doing stupid things, unexpected fails. DO NOT rely on the transcript (it's mostly noise/reactions).
+
+WHAT TO PICK:
+- Moments where something VISUALLY FUNNY happens: falls, crashes, fails, surprises, animals being chaotic
+- Moments with a clear BUILDUP then PAYOFF (setup → fail)
+- Pick clips that would make someone LAUGH OUT LOUD
+- STRONGLY PREFER longer scenes (6-15 seconds) that show the full setup before the fail
+- If a scene is short (under 5s), only pick it if it's EXTREMELY funny
+- SKIP: boring/dark/static footage, talking heads, intros/outros, mildly amusing moments
+
+VIDEO_DURATION_SECONDS: {video_duration}
+
+===== SCENE LIST =====
+{scene_list}
+=====
+
+RULES:
+- Select scenes by SCENE ID. Do NOT invent timestamps.
+- Each TOP = ONE scene only.
+- trim_start = scene start time, trim_end = scene end time. USE THE FULL SCENE. Do NOT trim shorter — every second of buildup matters.
+- PREFER longer scenes. Short scenes (under 5s) usually lack buildup and are less funny.
+- Position {num_clips} = least impressive. Position 1 = BEST clip.
+
+TITLE RULES (VERY IMPORTANT):
+- ranking_title describes the PHYSICAL ACTION you would SEE in the clip.
+- 3-4 words, ALL CAPS, no emoji.
+- GOOD examples: "FALLS OFF SKATEBOARD", "CAR HITS WALL", "DOG STEALS FOOD", "SLIPS ON ICE"
+- BAD examples (NEVER USE): anything from the transcript/audio, names, song lyrics, "JENNY JENNY", "ENDLESS LOOP", "MANTRA BEGINS", reactions like "OH MY GOD"
+- If you cannot determine the visual action, use a GENERIC FAIL description like "EPIC FAIL MOMENT"
+
+OUTPUT — RETURN ONLY VALID JSON (no markdown, no comments):
+{{
+  "video_title_for_youtube_short": "<YouTube title 100 chars max>",
+  "video_description_for_tiktok": "<TikTok description with CTA>",
+  "video_description_for_instagram": "<Instagram description with CTA>",
+  "hashtags_tiktok": "<8-12 hashtags>",
+  "hashtags_instagram": "<8-12 hashtags>",
+  "shorts": [
+    {{
+      "rank": {num_clips},
+      "scene_id": <integer scene ID>,
+      "trim_start": <number>,
+      "trim_end": <number>,
+      "ranking_title": "<PHYSICAL ACTION, 3-4 words, ALL CAPS>"
+    }},
+    ... (continue for each rank down to rank 1)
+  ]
+}}
+"""
+
+# Fallback prompt when no scene detection is available (e.g. very short videos)
+GEMINI_RANKING_PROMPT_TEMPLATE_NO_SCENES = """
+You are selecting the {num_clips} best clips from a FAIL COMPILATION for a "TOP {num_clips}" ranking Short.
+
+⚠️ This is a COMPILATION of SEPARATE short clips. The transcript is mostly reactions and background noise — DO NOT choose moments based on what is SAID. Choose based on where PHYSICAL ACTIONS happen (falls, crashes, fails, surprises).
+
+TIMESTAMP RULES:
+- Absolute seconds, up to 3 decimals. 0 ≤ start < end ≤ VIDEO_DURATION_SECONDS.
+- Each clip: 5-10 seconds.
+- NON-OVERLAPPING clips covering distinct moments.
+
+VIDEO_DURATION_SECONDS: {video_duration}
+
+TRANSCRIPT_TEXT (raw):
+{transcript_text}
+
+WORDS_JSON (array of {{w, s, e}} where s/e are seconds):
+{words_json}
+
+RANKING:
+- Position {num_clips} = least impressive. Position 1 = BEST clip.
+
+TITLE RULES:
+- Describe the PHYSICAL ACTION visible in the clip. 3-4 words, ALL CAPS, no emoji.
+- GOOD: "FALLS OFF SKATEBOARD", "CAR HITS WALL", "SLIPS ON ICE"
+- BAD (NEVER USE): transcript words, names, lyrics, reactions, "ENDLESS LOOP", "JENNY JENNY"
+
+OUTPUT — RETURN ONLY VALID JSON:
+{{
+  "video_title_for_youtube_short": "<YouTube title 100 chars max>",
+  "video_description_for_tiktok": "<TikTok description with CTA>",
+  "video_description_for_instagram": "<Instagram description with CTA>",
+  "hashtags_tiktok": "<8-12 hashtags>",
+  "hashtags_instagram": "<8-12 hashtags>",
+  "shorts": [
+    {{
+      "rank": {num_clips},
+      "start": <number>,
+      "end": <number>,
+      "ranking_title": "<PHYSICAL ACTION, 3-4 words, ALL CAPS>"
+    }},
+    ... (continue for each rank down to rank 1)
+  ]
+}}
+"""
+
+GEMINI_SHORT_PROMPT_TEMPLATE = """
+You are a senior short-form video editor. Read the transcript of this SHORT video (already a clip, under 90 seconds) and generate optimized metadata for reposting on TikTok, Instagram Reels, and YouTube Shorts.
+
+VIDEO_DURATION_SECONDS: {video_duration}
+
+TRANSCRIPT_TEXT (raw):
+{transcript_text}
+
+Generate engaging metadata that will maximize views and engagement. MUST BE IN THE SAME LANGUAGE AS THE VIDEO TRANSCRIPT (except universal hashtags like #fyp, #reels).
+
+OUTPUT — RETURN ONLY VALID JSON (no markdown, no comments):
+{{
+  "shorts": [
+    {{
+      "start": 0,
+      "end": {video_duration},
+      "video_description_for_tiktok": "<engaging TikTok description with CTA, oriented to get views>",
+      "video_description_for_instagram": "<engaging Instagram description with CTA, oriented to get views>",
+      "video_title_for_youtube_short": "<catchy title for YouTube Short, 100 chars max>",
+      "viral_hook_text": "<SHORT punchy text overlay (max 10 words). Examples: 'POV: You realized...', 'Did you know?', 'Stop doing this!'>",
+      "hashtags_tiktok": "<8-12 hashtags for TikTok. Mix of trending + niche + discovery. MUST start with #. Example: #fyp #viral #pourtoi #tech>",
+      "hashtags_instagram": "<8-12 hashtags for Instagram Reels. Mix of trending + niche + community. MUST start with #. Example: #reels #explore #trending #tech>"
     }}
   ]
 }}
@@ -334,6 +462,17 @@ def detect_person_yolo(frame):
                 
     return best_box
 
+def remove_watermark_crop(frame, crop_percent=4):
+    """
+    Crops a small percentage from all edges of the frame to remove watermarks/logos.
+    Default 4% crop removes corner watermarks (ARTE, CNN, BBC, etc.) while preserving content.
+    """
+    h, w = frame.shape[:2]
+    crop_x = int(w * crop_percent / 100)
+    crop_y = int(h * crop_percent / 100)
+    return frame[crop_y:h-crop_y, crop_x:w-crop_x]
+
+
 def create_general_frame(frame, output_width, output_height):
     """
     Creates a 'General Shot' frame: 
@@ -358,18 +497,20 @@ def create_general_frame(frame, output_width, output_height):
     # Blur background
     background = cv2.GaussianBlur(background, (51, 51), 0)
     
-    # 2. Foreground (Fit Width)
-    scale = output_width / orig_w
+    # 2. Foreground (Fit inside output — scale to fit both width AND height)
+    scale = min(output_width / orig_w, output_height / orig_h)
+    fg_w = int(orig_w * scale)
     fg_h = int(orig_h * scale)
-    foreground = cv2.resize(frame, (output_width, fg_h))
+    foreground = cv2.resize(frame, (fg_w, fg_h))
     
-    # 3. Overlay
+    # 3. Overlay (center both horizontally and vertically)
     y_offset = (output_height - fg_h) // 2
-    
+    x_offset = (output_width - fg_w) // 2
+
     # Clone background to avoid modifying it
     final_frame = background.copy()
-    final_frame[y_offset:y_offset+fg_h, :] = foreground
-    
+    final_frame[y_offset:y_offset+fg_h, x_offset:x_offset+fg_w] = foreground
+
     return final_frame
 
 def analyze_scenes_strategy(video_path, scenes):
@@ -420,16 +561,14 @@ def analyze_scenes_strategy(video_path, scenes):
     cap.release()
     return strategies
 
-def detect_scenes(video_path):
-    video_manager = VideoManager([video_path])
+def detect_scenes(video_path, threshold=27.0):
+    """Detect scenes using the modern open_video() API (VideoManager is deprecated and broken)."""
+    video = open_video(video_path)
     scene_manager = SceneManager()
-    scene_manager.add_detector(ContentDetector())
-    video_manager.set_downscale_factor()
-    video_manager.start()
-    scene_manager.detect_scenes(frame_source=video_manager)
+    scene_manager.add_detector(ContentDetector(threshold=threshold))
+    scene_manager.detect_scenes(video)
     scene_list = scene_manager.get_scene_list()
-    fps = video_manager.get_framerate()
-    video_manager.release()
+    fps = video.frame_rate
     return scene_list, fps
 
 def get_video_resolution(video_path):
@@ -443,10 +582,18 @@ def get_video_resolution(video_path):
 
 
 def sanitize_filename(filename):
-    """Remove invalid characters from filename."""
-    filename = re.sub(r'[<>:"/\\|?*]', '', filename)
+    """Remove invalid characters from filename. Also remove URL-unsafe chars like # and unicode quotes."""
+    # Remove common problematic characters for filesystems AND URLs
+    filename = re.sub(r'[<>:"/\\|?*#%&{}$!@`=+\[\]]', '', filename)
+    # Replace unicode quotes/apostrophes with ASCII equivalent
+    filename = filename.replace('\u2019', "'").replace('\u2018', "'")
+    filename = filename.replace('\u201c', '').replace('\u201d', '')
+    # Remove any remaining non-ASCII characters that could cause URL issues
+    filename = filename.encode('ascii', 'ignore').decode('ascii')
     filename = filename.replace(' ', '_')
-    return filename[:100]
+    # Remove consecutive underscores
+    filename = re.sub(r'_+', '_', filename)
+    return filename.strip('_')[:100]
 
 
 def download_youtube_video(url, output_dir="."):
@@ -490,10 +637,10 @@ def download_youtube_video(url, output_dir="."):
         'fragment_retries': 10,
         'nocheckcertificate': True,
         'cachedir': False,
+        'js_runtimes': {'node': {}},
         'extractor_args': {
             'youtube': {
-                'player_client': ['tv_embed', 'android', 'mweb', 'web'],
-                'player_skip': ['webpage', 'configs'],
+                'player_client': ['web', 'mweb', 'android', 'tv_embed'],
             }
         },
         'http_headers': {
@@ -553,17 +700,31 @@ Technical Details: {str(e)}
     if os.path.exists(expected_file):
         os.remove(expected_file)
         print(f"🗑️  Removed existing file to re-download with H.264 codec")
-    
-    ydl_opts = {
-        **_COMMON_YDL_OPTS,
-        'format': 'bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc1]+bestaudio/best[ext=mp4]/best',
-        'outtmpl': output_template,
-        'merge_output_format': 'mp4',
-        'overwrites': True,
-    }
-    
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+
+    # Use yt-dlp CLI via subprocess for reliable JS challenge solving
+    # The Python API doesn't properly pass remote_components for EJS
+    cmd = [
+        'yt-dlp',
+        '--remote-components', 'ejs:github',
+        '--js-runtimes', 'node',
+        '-f', 'bestvideo[height>=1080][vcodec!~="av01"]+bestaudio/bestvideo[vcodec!~="av01"]+bestaudio/bestvideo+bestaudio/best',
+        '--merge-output-format', 'mp4',
+        '-o', output_template,
+        '--no-check-certificates',
+        '--socket-timeout', '30',
+        '--retries', '10',
+        '--fragment-retries', '10',
+    ]
+    if cookies_path:
+        cmd.extend(['--cookies', cookies_path])
+    cmd.append(url)
+
+    print(f"📥 Running: {' '.join(cmd[:8])}...")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"⚠️ yt-dlp stderr: {result.stderr[-500:]}")
+        raise RuntimeError(f"yt-dlp download failed: {result.stderr[-200:]}")
+    print(result.stdout[-300:] if result.stdout else "")
     
     downloaded_file = os.path.join(output_dir, f'{sanitized_title}.mp4')
     
@@ -578,9 +739,10 @@ Technical Details: {str(e)}
     
     return downloaded_file, sanitized_title
 
-def process_video_to_vertical(input_video, final_output_video):
+def process_video_to_vertical(input_video, final_output_video, force_general=False):
     """
     Core logic to convert horizontal video to vertical using scene detection and Active Speaker Tracking (MediaPipe).
+    force_general: if True, always use blur-background GENERAL layout (skip face-tracking TRACK mode).
     """
     script_start_time = time.time()
     
@@ -610,12 +772,28 @@ def process_video_to_vertical(input_video, final_output_video):
     print(f"   ✅ Found {len(scenes)} scenes.")
 
     print("\n   🧠 Step 2: Preparing Active Tracking...")
-    original_width, original_height = get_video_resolution(input_video)
-    
-    OUTPUT_HEIGHT = original_height
-    OUTPUT_WIDTH = int(OUTPUT_HEIGHT * ASPECT_RATIO)
+    raw_width, raw_height = get_video_resolution(input_video)
+
+    # Account for watermark crop (4% from each side)
+    crop_pct = 4
+    original_width = raw_width - 2 * int(raw_width * crop_pct / 100)
+    original_height = raw_height - 2 * int(raw_height * crop_pct / 100)
+    print(f"   ✂️  Watermark crop: {raw_width}x{raw_height} → {original_width}x{original_height}")
+
+    # Target 1080x1920 (Full HD vertical) as minimum output resolution
+    # For higher-res sources (1440p, 4K), scale up proportionally
+    if original_height >= 1080:
+        OUTPUT_WIDTH = max(1080, int(original_height * ASPECT_RATIO))
+        OUTPUT_HEIGHT = int(OUTPUT_WIDTH / ASPECT_RATIO)
+    else:
+        # For lower-res sources, upscale to 1080x1920
+        OUTPUT_WIDTH = 1080
+        OUTPUT_HEIGHT = 1920
     if OUTPUT_WIDTH % 2 != 0:
         OUTPUT_WIDTH += 1
+    if OUTPUT_HEIGHT % 2 != 0:
+        OUTPUT_HEIGHT += 1
+    print(f"   📐 Output resolution: {OUTPUT_WIDTH}x{OUTPUT_HEIGHT} (source: {original_width}x{original_height})")
 
     # Initialize Cameraman
     cameraman = SmoothedCameraman(OUTPUT_WIDTH, OUTPUT_HEIGHT, original_width, original_height)
@@ -631,7 +809,7 @@ def process_video_to_vertical(input_video, final_output_video):
         'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
         '-s', f'{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}', '-pix_fmt', 'bgr24',
         '-r', str(fps), '-i', '-', '-c:v', 'libx264',
-        '-preset', 'fast', '-crf', '23', '-an', temp_video_output
+        '-preset', 'medium', '-crf', '18', '-pix_fmt', 'yuv420p', '-an', temp_video_output
     ]
 
     ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -656,6 +834,9 @@ def process_video_to_vertical(input_video, final_output_video):
             if not ret:
                 break
 
+            # Remove watermarks/logos by cropping edges (4% from each side)
+            frame = remove_watermark_crop(frame, crop_percent=4)
+
             # Update Scene Index
             if current_scene_index < len(scene_boundaries):
                 start_f, end_f = scene_boundaries[current_scene_index]
@@ -663,8 +844,10 @@ def process_video_to_vertical(input_video, final_output_video):
                     current_scene_index += 1
             
             # Determine Strategy for current frame based on scene
-            current_strategy = scene_strategies[current_scene_index] if current_scene_index < len(scene_strategies) else 'TRACK'
-            
+            current_strategy = 'GENERAL' if force_general else (
+                scene_strategies[current_scene_index] if current_scene_index < len(scene_strategies) else 'TRACK'
+            )
+
             # Apply Strategy
             if current_strategy == 'GENERAL':
                 # "Plano General" -> Blur Background + Fit Width
@@ -886,6 +1069,266 @@ def get_viral_clips(transcript_result, video_duration):
         print(f"❌ Gemini Error: {e}")
         return None
 
+def get_ranking_clips(transcript_result, video_duration, num_clips=6, scene_boundaries=None, video_path=None):
+    """Use Gemini with VIDEO INPUT to identify ranked moments (TOP N → TOP 1).
+
+    Uploads the actual video file to Gemini so the AI can SEE the content,
+    not just read the transcript. This is critical for compilation videos
+    where the transcript is mostly reactions/noise.
+    """
+    print(f"🏆 Analyzing with Gemini Vision (Ranking mode, TOP {num_clips})...")
+
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        print("❌ Error: GEMINI_API_KEY not found.")
+        return None
+
+    client = genai.Client(api_key=api_key)
+    model_name = 'gemini-2.5-flash'
+
+    words = []
+    for segment in transcript_result['segments']:
+        for word in segment.get('words', []):
+            words.append({'w': word['word'], 's': word['start'], 'e': word['end']})
+
+    use_scene_mode = scene_boundaries and len(scene_boundaries) >= num_clips
+
+    # Upload video file to Gemini for visual analysis
+    uploaded_file = None
+    if video_path and os.path.exists(video_path):
+        try:
+            file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+            print(f"   📤 Uploading video to Gemini ({file_size_mb:.1f} MB)...")
+            uploaded_file = client.files.upload(file=video_path)
+            print(f"   ✅ Video uploaded: {uploaded_file.name}")
+
+            # Wait for file to be processed (must reach ACTIVE state)
+            import time
+            max_wait = 300  # 5 minutes max
+            waited = 0
+            while waited < max_wait:
+                uploaded_file = client.files.get(name=uploaded_file.name)
+                state_str = str(uploaded_file.state).upper() if uploaded_file.state else ""
+                if "ACTIVE" in state_str:
+                    print(f"   ✅ Video processed and ACTIVE (waited {waited}s)")
+                    break
+                if "FAILED" in state_str:
+                    print(f"   ❌ Video processing FAILED")
+                    uploaded_file = None
+                    break
+                print(f"   ⏳ Waiting for video processing... ({waited}s, state: {state_str})")
+                time.sleep(5)
+                waited += 5
+            else:
+                print(f"   ❌ Video processing timeout after {max_wait}s")
+                uploaded_file = None
+        except Exception as e:
+            print(f"   ⚠️ Video upload failed: {e}, falling back to text-only mode")
+            uploaded_file = None
+
+    if use_scene_mode:
+        print(f"   🎯 Scene-based mode: {len(scene_boundaries)} scenes detected")
+
+        scene_lines = []
+        for i, (s, e) in enumerate(scene_boundaries):
+            duration = e - s
+            scene_lines.append(f"[Scene {i+1}] {s:.1f}s–{e:.1f}s ({duration:.1f}s)")
+
+        scene_list_text = "\n".join(scene_lines)
+
+        prompt = GEMINI_RANKING_PROMPT_TEMPLATE.format(
+            num_clips=num_clips,
+            video_duration=video_duration,
+            scene_list=scene_list_text
+        )
+    else:
+        print(f"   ⚠️ No scene boundaries (or too few), using free-form timestamp mode")
+        prompt = GEMINI_RANKING_PROMPT_TEMPLATE_NO_SCENES.format(
+            num_clips=num_clips,
+            video_duration=video_duration,
+            transcript_text=json.dumps(transcript_result['text']),
+            words_json=json.dumps(words)
+        )
+
+    try:
+        # Send video + prompt to Gemini (video first for best results)
+        if uploaded_file:
+            print(f"   🎬 Sending video + prompt to Gemini Vision...")
+            contents = [uploaded_file, prompt]
+        else:
+            contents = prompt
+        response = client.models.generate_content(model=model_name, contents=contents)
+
+        try:
+            usage = response.usage_metadata
+            if usage:
+                input_price_per_million = 0.10
+                output_price_per_million = 0.40
+                prompt_tokens = usage.prompt_token_count
+                output_tokens = usage.candidates_token_count
+                input_cost = (prompt_tokens / 1_000_000) * input_price_per_million
+                output_cost = (output_tokens / 1_000_000) * output_price_per_million
+                cost_analysis = {
+                    "input_tokens": prompt_tokens, "output_tokens": output_tokens,
+                    "input_cost": input_cost, "output_cost": output_cost,
+                    "total_cost": input_cost + output_cost, "model": model_name
+                }
+                print(f"💰 Total cost: ${cost_analysis['total_cost']:.6f}")
+        except Exception:
+            cost_analysis = None
+
+        text = response.text
+        if text.startswith("```json"):
+            text = text[7:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+
+        result_json = json.loads(text)
+        if cost_analysis:
+            result_json['cost_analysis'] = cost_analysis
+
+        # === MAP SCENE IDs TO TIMESTAMPS (scene-based mode) ===
+        if use_scene_mode and 'shorts' in result_json:
+            for clip in result_json['shorts']:
+                scene_id = clip.get('scene_id')
+                if scene_id is not None:
+                    idx = max(0, min(scene_id - 1, len(scene_boundaries) - 1))
+                    scene_start, scene_end = scene_boundaries[idx]
+                    # Use Gemini's trim points if provided and valid, else use full scene
+                    trim_start = clip.get('trim_start')
+                    trim_end = clip.get('trim_end')
+                    if (trim_start is not None and trim_end is not None
+                            and trim_start >= scene_start - 0.5 and trim_end <= scene_end + 0.5
+                            and trim_end > trim_start):
+                        clip['start'] = max(trim_start, 0)
+                        clip['end'] = min(trim_end, video_duration)
+                        print(f"   ✅ Rank {clip.get('rank')}: Scene {idx+1}, trimmed {clip['start']:.1f}s–{clip['end']:.1f}s")
+                    else:
+                        clip['start'] = scene_start
+                        clip['end'] = scene_end
+                        print(f"   ✅ Rank {clip.get('rank')}: Scene {idx+1} = {clip['start']:.1f}s–{clip['end']:.1f}s (full scene)")
+                else:
+                    print(f"   ⚠️ Rank {clip.get('rank')}: missing scene_id, using raw start/end")
+
+        # Ensure clips are ordered rank N → 1 (ascending rank = descending position)
+        if 'shorts' in result_json:
+            result_json['shorts'].sort(key=lambda x: x.get('rank', 999), reverse=True)
+
+        return result_json
+    except Exception as e:
+        print(f"❌ Gemini Ranking Error: {e}")
+        return None
+    finally:
+        # Cleanup uploaded video file from Gemini storage
+        if uploaded_file:
+            try:
+                client.files.delete(name=uploaded_file.name)
+                print(f"   🗑️ Cleaned up uploaded video from Gemini")
+            except Exception:
+                pass
+
+
+def get_short_metadata(transcript_result, video_duration):
+    """Generate metadata (titles, descriptions, hashtags) for a short video without clip detection."""
+    print("🤖  Analyzing short video with Gemini (metadata only)...")
+
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        print("❌ Error: GEMINI_API_KEY not found in environment variables.")
+        return None
+
+    client = genai.Client(api_key=api_key)
+    model_name = 'gemini-2.5-flash'
+
+    prompt = GEMINI_SHORT_PROMPT_TEMPLATE.format(
+        video_duration=round(video_duration, 3),
+        transcript_text=json.dumps(transcript_result['text']),
+    )
+
+    try:
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt
+        )
+
+        # Cost calculation
+        cost_analysis = None
+        try:
+            usage = response.usage_metadata
+            if usage:
+                input_price_per_million = 0.10
+                output_price_per_million = 0.40
+                prompt_tokens = usage.prompt_token_count
+                output_tokens = usage.candidates_token_count
+                input_cost = (prompt_tokens / 1_000_000) * input_price_per_million
+                output_cost = (output_tokens / 1_000_000) * output_price_per_million
+                total_cost = input_cost + output_cost
+                cost_analysis = {
+                    "input_tokens": prompt_tokens,
+                    "output_tokens": output_tokens,
+                    "input_cost": input_cost,
+                    "output_cost": output_cost,
+                    "total_cost": total_cost,
+                    "model": model_name
+                }
+                print(f"💰 Token Usage ({model_name}): ${total_cost:.6f}")
+        except Exception as e:
+            print(f"⚠️ Could not calculate cost: {e}")
+
+        text = response.text
+        if text.startswith("```json"):
+            text = text[7:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+
+        result_json = json.loads(text)
+        if cost_analysis:
+            result_json['cost_analysis'] = cost_analysis
+        return result_json
+    except Exception as e:
+        print(f"❌ Gemini Error: {e}")
+        return None
+
+def process_short_video(input_video, output_video):
+    """Process an already-short video: remove watermark, re-encode. Skip reframing if already vertical."""
+    width, height = get_video_resolution(input_video)
+    is_vertical = height > width
+
+    if is_vertical:
+        print(f"   📱 Video is already vertical ({width}x{height}), applying watermark removal + re-encode...")
+
+        # Calculate crop for watermark removal (4% from each edge)
+        crop_pct = 4
+        crop_x = int(width * crop_pct / 100)
+        crop_y = int(height * crop_pct / 100)
+        cropped_w = width - 2 * crop_x
+        cropped_h = height - 2 * crop_y
+        # Ensure even dimensions
+        if cropped_w % 2 != 0:
+            cropped_w -= 1
+        if cropped_h % 2 != 0:
+            cropped_h -= 1
+
+        cmd = [
+            'ffmpeg', '-y', '-i', input_video,
+            '-vf', f'crop={cropped_w}:{cropped_h}:{crop_x}:{crop_y}',
+            '-c:v', 'libx264', '-crf', '18', '-preset', 'medium',
+            '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac', '-b:a', '192k',
+            output_video
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if result.returncode != 0:
+            print(f"   ⚠️ FFmpeg error: {result.stderr.decode()[-300:]}")
+            return False
+        print(f"   ✅ Short video processed: {output_video}")
+        return True
+    else:
+        print(f"   🔄 Video is horizontal ({width}x{height}), converting to vertical...")
+        return process_video_to_vertical(input_video, output_video)
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="AutoCrop-Vertical with Viral Clip Detection.")
     
@@ -896,6 +1339,10 @@ if __name__ == '__main__':
     parser.add_argument('-o', '--output', type=str, help="Output directory or file (if processing whole video).")
     parser.add_argument('--keep-original', action='store_true', help="Keep the downloaded YouTube video.")
     parser.add_argument('--skip-analysis', action='store_true', help="Skip AI analysis and convert the whole video.")
+    parser.add_argument('--mode', type=str, default='ranking', choices=['normal', 'ranking'],
+                        help="'normal' = extract only the single best viral clip. 'ranking' = extract all clips (for auto-compilation).")
+    parser.add_argument('--force-general', action='store_true',
+                        help="Force GENERAL (blur background) layout for all scenes, skipping face-tracking mode.")
     
     args = parser.parse_args()
 
@@ -943,73 +1390,348 @@ if __name__ == '__main__':
         print(f"❌ Input file not found: {input_video}")
         exit(1)
 
-    # 2. Decision: Analyze clips or process whole?
+    # 2. Get video duration and decide processing mode
+    cap = cv2.VideoCapture(input_video)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = frame_count / fps
+    cap.release()
+
+    SHORT_VIDEO_THRESHOLD = 90  # seconds
+
     if args.skip_analysis:
         print("⏩ Skipping analysis, processing entire video...")
         output_file = args.output if args.output else os.path.join(output_dir, f"{video_title}_vertical.mp4")
         process_video_to_vertical(input_video, output_file)
-    else:
-        # 3. Transcribe
-        transcript = transcribe_video(input_video)
-        
-        # Get duration
-        cap = cv2.VideoCapture(input_video)
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration = frame_count / fps
-        cap.release()
+    elif duration <= SHORT_VIDEO_THRESHOLD:
+        # --- SHORT REPOST MODE ---
+        print(f"\n📱 Short video detected ({duration:.1f}s <= {SHORT_VIDEO_THRESHOLD}s) — Short Repost mode")
 
-        # 4. Gemini Analysis
-        clips_data = get_viral_clips(transcript, duration)
-        
+        # Transcribe
+        transcript = transcribe_video(input_video)
+
+        # Get metadata from Gemini (titles, descriptions, hashtags — no clip detection)
+        clips_data = get_short_metadata(transcript, duration)
+
+        if not clips_data or 'shorts' not in clips_data:
+            print("⚠️ Gemini metadata generation failed. Processing with default metadata.")
+            clips_data = {
+                "shorts": [{
+                    "start": 0,
+                    "end": round(duration, 3),
+                    "video_description_for_tiktok": "",
+                    "video_description_for_instagram": "",
+                    "video_title_for_youtube_short": video_title,
+                    "viral_hook_text": "",
+                    "hashtags_tiktok": "",
+                    "hashtags_instagram": ""
+                }]
+            }
+
+        # Save metadata
+        clips_data['transcript'] = transcript
+        metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
+        with open(metadata_file, 'w') as f:
+            json.dump(clips_data, f, indent=2)
+        print(f"   Saved metadata to {metadata_file}")
+
+        # Process the single clip (remove watermark, skip reframing if already vertical)
+        clip_filename = f"{video_title}_clip_1.mp4"
+        clip_final_path = os.path.join(output_dir, clip_filename)
+
+        print(f"\n🎬 Processing Short: {clip_filename}")
+        success = process_short_video(input_video, clip_final_path)
+        if success:
+            print(f"   ✅ Short ready: {clip_final_path}")
+    else:
+        # --- LONG VIDEO MODE (existing pipeline) ---
+        # Transcribe
+        transcript = transcribe_video(input_video)
+
+        # Gemini Analysis
+        RANKING_CLIPS_PER_SHORT = 5  # 5 clips per ranking Short (TOP 5 → TOP 1)
+        RANKING_NUM_SHORTS = 3  # generate 3 ranking shorts
+        RANKING_MAX_CLIP_DURATION = 60  # no real limit — trust Gemini's scene selection
+        if args.mode == 'ranking':
+            # Run scene detection BEFORE Gemini to identify visual cuts
+            # Moderate threshold (18.0) — catches real scene changes but keeps clips long enough
+            print("🎬 Pre-detecting scenes for ranking alignment (threshold=18.0)...")
+            pre_scenes, _ = detect_scenes(input_video, threshold=18.0)
+            scene_bounds = [(s.get_seconds(), e.get_seconds()) for s, e in pre_scenes] if pre_scenes else None
+            if scene_bounds:
+                # Filter out short scenes (< 4s) — too short for a good ranking clip
+                scene_bounds = [(s, e) for s, e in scene_bounds if e - s >= 4.0]
+                print(f"   ✅ Found {len(scene_bounds)} visual scenes (after splitting long ones)")
+                for i, (s, e) in enumerate(scene_bounds):
+                    print(f"      Scene {i+1}: {s:.1f}s – {e:.1f}s ({e-s:.1f}s)")
+            else:
+                print("   ⚠️ No scenes detected, Gemini will use free-form timestamps")
+            total_clips_needed = RANKING_CLIPS_PER_SHORT * RANKING_NUM_SHORTS
+            clips_data = get_ranking_clips(transcript, duration, num_clips=total_clips_needed, scene_boundaries=scene_bounds, video_path=input_video)
+        else:
+            clips_data = get_viral_clips(transcript, duration)
+
         if not clips_data or 'shorts' not in clips_data:
             print("❌ Failed to identify clips. Converting whole video as fallback.")
             output_file = os.path.join(output_dir, f"{video_title}_vertical.mp4")
             process_video_to_vertical(input_video, output_file)
         else:
             print(f"🔥 Found {len(clips_data['shorts'])} viral clips!")
-            
+
+            # In Normal mode, keep only the single best (first) clip
+            if args.mode == 'normal':
+                clips_data['shorts'] = clips_data['shorts'][:1]
+                print(f"🎯 Normal mode: keeping only the best clip.")
+
             # Save metadata
-            clips_data['transcript'] = transcript # Save full transcript for subtitles
+            clips_data['transcript'] = transcript
             metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
             with open(metadata_file, 'w') as f:
                 json.dump(clips_data, f, indent=2)
             print(f"   Saved metadata to {metadata_file}")
 
-            # 5. Process each clip
-            for i, clip in enumerate(clips_data['shorts']):
-                start = clip['start']
-                end = clip['end']
-                print(f"\n🎬 Processing Clip {i+1}: {start}s - {end}s")
-                print(f"   Title: {clip.get('video_title_for_youtube_short', 'No Title')}")
-                
-                # Cut clip
-                clip_filename = f"{video_title}_clip_{i+1}.mp4"
-                clip_temp_path = os.path.join(output_dir, f"temp_{clip_filename}")
-                clip_final_path = os.path.join(output_dir, clip_filename)
-                
-                # ffmpeg cut
-                # Using re-encoding for precision as requested by strict seconds
-                cut_command = [
-                    'ffmpeg', '-y', 
-                    '-ss', str(start), 
-                    '-to', str(end), 
-                    '-i', input_video,
-                    '-c:v', 'libx264', '-crf', '18', '-preset', 'fast',
-                    '-c:a', 'aac',
-                    clip_temp_path
-                ]
-                subprocess.run(cut_command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                
-                # Process vertical
-                success = process_video_to_vertical(clip_temp_path, clip_final_path)
-                
-                if success:
-                    print(f"   ✅ Clip {i+1} ready: {clip_final_path}")
-                
-                # Clean up temp cut
-                if os.path.exists(clip_temp_path):
-                    os.remove(clip_temp_path)
+            if args.mode == 'ranking':
+                # --- RANKING MODE: 5 ranked clips (5-8s each) = ~25-40s ---
+                from hooks import strip_emojis
+
+                # Snap each clip to nearest scene boundary (only for fallback/no-scene mode)
+                already_scene_mapped = scene_bounds and len(scene_bounds) >= RANKING_CLIPS_PER_SHORT
+                if scene_bounds and len(scene_bounds) > 1 and not already_scene_mapped:
+                    print(f"\n🔒 Snapping {len(clips_data['shorts'])} clips to scene boundaries...")
+                    used_scenes = set()
+                    for clip in clips_data['shorts']:
+                        clip_mid = (clip['start'] + clip['end']) / 2
+                        best_scene = None
+                        best_dist = float('inf')
+                        for si, (s_start, s_end) in enumerate(scene_bounds):
+                            if si in used_scenes:
+                                continue
+                            scene_mid = (s_start + s_end) / 2
+                            dist = abs(clip_mid - scene_mid)
+                            if dist < best_dist:
+                                best_dist = dist
+                                best_scene = (si, s_start, s_end)
+                        if best_scene:
+                            used_scenes.add(best_scene[0])
+                            old_start, old_end = clip['start'], clip['end']
+                            clip['start'] = best_scene[1]
+                            clip['end'] = best_scene[2]
+                            print(f"   Rank {clip.get('rank')}: {old_start:.1f}–{old_end:.1f}s → snapped to {clip['start']:.1f}–{clip['end']:.1f}s ({clip['end']-clip['start']:.1f}s)")
+
+                # Enforce max clip duration: trim to best RANKING_MAX_CLIP_DURATION seconds
+                for clip in clips_data['shorts']:
+                    clip_dur = clip['end'] - clip['start']
+                    if clip_dur > RANKING_MAX_CLIP_DURATION:
+                        excess = clip_dur - RANKING_MAX_CLIP_DURATION
+                        new_start = clip['start'] + excess / 2
+                        clip['start'] = new_start
+                        clip['end'] = new_start + RANKING_MAX_CLIP_DURATION
+                        print(f"   ✂️ Rank {clip.get('rank')}: trimmed to {RANKING_MAX_CLIP_DURATION}s ({clip['start']:.1f}–{clip['end']:.1f}s)")
+
+                # Sort all clips by rank descending
+                all_shorts = clips_data['shorts']
+                all_shorts.sort(key=lambda x: x.get('rank', 999), reverse=True)
+
+                # Split into batches of RANKING_CLIPS_PER_SHORT
+                batches = []
+                for i in range(0, len(all_shorts), RANKING_CLIPS_PER_SHORT):
+                    batch = all_shorts[i:i + RANKING_CLIPS_PER_SHORT]
+                    if len(batch) >= 3:  # need at least 3 clips for a ranking
+                        batches.append(batch)
+
+                print(f"\n🎬 === Generating {len(batches)} Ranking Short(s) from {len(all_shorts)} clips ===")
+
+                for batch_idx, batch in enumerate(batches):
+                    # Re-number ranks within this batch (N → 1)
+                    for i, clip in enumerate(batch):
+                        clip['_local_rank'] = len(batch) - i
+
+                    print(f"\n🎬 --- Ranking Short #{batch_idx + 1}: TOP {len(batch)} → TOP 1 ---")
+
+                    segment_paths = []
+                    segment_durations = []
+                    segment_ranks = []
+                    segment_titles = []
+
+                    for local_i, clip in enumerate(batch):
+                        local_rank = clip['_local_rank']
+                        start = clip['start']
+                        end = clip['end']
+                        clip_dur = end - start
+                        ranking_title = clip.get('ranking_title', f'TOP {local_rank}')
+                        print(f"  Extract TOP {local_rank}: {start:.1f}s - {end:.1f}s ({clip_dur:.1f}s) — {ranking_title}")
+
+                        seg_filename = f"temp_seg_{batch_idx}_{local_i}.mp4"
+                        seg_temp = os.path.join(output_dir, f"temp_raw_{seg_filename}")
+                        seg_vertical = os.path.join(output_dir, f"temp_vert_{seg_filename}")
+
+                        cut_cmd = [
+                            'ffmpeg', '-y', '-ss', str(start), '-to', str(end),
+                            '-i', input_video,
+                            '-c:v', 'libx264', '-crf', '18', '-preset', 'fast', '-r', '30',
+                            '-c:a', 'aac', seg_temp
+                        ]
+                        subprocess.run(cut_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+                        success = process_video_to_vertical(seg_temp, seg_vertical, force_general=True)
+                        if os.path.exists(seg_temp):
+                            os.remove(seg_temp)
+                        if not success:
+                            print(f"  ⚠️ Reframe failed for extract {local_i+1}, skipping")
+                            continue
+
+                        try:
+                            dur_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', seg_vertical]
+                            seg_dur = float(subprocess.check_output(dur_cmd).decode().strip())
+                        except Exception:
+                            seg_dur = clip_dur
+
+                        segment_paths.append(seg_vertical)
+                        segment_durations.append(seg_dur)
+                        segment_ranks.append(local_rank)
+                        segment_titles.append(ranking_title)
+                        print(f"  ✅ TOP {local_rank} ready ({seg_dur:.1f}s)")
+
+                    if len(segment_paths) < 2:
+                        print(f"  ❌ Not enough segments for Ranking #{batch_idx+1}, skipping")
+                        continue
+
+                    # Concatenate segments
+                    concat_raw = os.path.join(output_dir, f"{video_title}_ranking_raw_{batch_idx}.mp4")
+                    concat_list = os.path.join(output_dir, f"temp_concat_{batch_idx}.txt")
+                    with open(concat_list, 'w') as f:
+                        for sp in segment_paths:
+                            f.write(f"file '{os.path.abspath(sp)}'\n")
+
+                    concat_cmd = [
+                        'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
+                        '-i', concat_list,
+                        '-c:v', 'libx264', '-crf', '18', '-preset', 'fast',
+                        '-c:a', 'aac', '-b:a', '192k', '-pix_fmt', 'yuv420p',
+                        concat_raw
+                    ]
+                    result = subprocess.run(concat_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                    os.remove(concat_list)
+                    for sp in segment_paths:
+                        if os.path.exists(sp):
+                            os.remove(sp)
+
+                    if result.returncode != 0:
+                        print(f"❌ Concat failed for Ranking #{batch_idx+1}")
+                        continue
+
+                    # Burn cumulative scoreboard overlay
+                    print(f"  📊 Applying scoreboard overlay...")
+
+                    cumulative_time = 0.0
+                    seg_time_ranges = []
+                    for dur in segment_durations:
+                        seg_time_ranges.append((cumulative_time, cumulative_time + dur))
+                        cumulative_time += dur
+
+                    title_files = []
+                    for i, (rank, title) in enumerate(zip(segment_ranks, segment_titles)):
+                        txt_path = os.path.join(output_dir, f"temp_sb_{batch_idx}_{i}.txt")
+                        clean = strip_emojis(title).strip() or f'TOP {rank}'
+                        with open(txt_path, 'w', encoding='utf-8') as f:
+                            f.write(f"TOP {rank}  {clean}")
+                        title_files.append(txt_path)
+
+                    try:
+                        dim_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'stream=width,height', '-of', 'csv=s=x:p=0', concat_raw]
+                        dims = subprocess.check_output(dim_cmd).decode().strip().split('\n')[0].split('x')
+                        vw, vh = int(dims[0]), int(dims[1])
+                    except Exception:
+                        vw, vh = 1080, 1920
+
+                    font_spec = "font=Liberation Sans Bold"
+                    active_fontsize = int(vw * 0.046)
+                    past_fontsize = int(vw * 0.036)
+                    line_height = int(vh * 0.035)
+                    base_y = int(vh * 0.55)
+                    margin_x = int(vw * 0.05)
+
+                    filter_parts = []
+                    total_segments = len(segment_ranks)
+
+                    for seg_idx in range(total_segments):
+                        seg_start, seg_end = seg_time_ranges[seg_idx]
+                        txt_esc = title_files[seg_idx].replace(":", "\\:").replace("'", "'\\''")
+                        line_y = base_y + seg_idx * line_height
+
+                        # Active state
+                        filter_parts.append(
+                            f"drawtext=textfile='{txt_esc}':fontsize={active_fontsize}:fontcolor=black@0.5"
+                            f":x={margin_x}+2:y={line_y}+2:{font_spec}:enable='between(t,{seg_start:.3f},{seg_end:.3f})'"
+                        )
+                        filter_parts.append(
+                            f"drawtext=textfile='{txt_esc}':fontsize={active_fontsize}:fontcolor=white"
+                            f":borderw=4:bordercolor=black:x={margin_x}:y={line_y}:{font_spec}:enable='between(t,{seg_start:.3f},{seg_end:.3f})'"
+                        )
+                        # Past state
+                        if seg_idx < total_segments - 1:
+                            next_start = seg_time_ranges[seg_idx + 1][0]
+                            filter_parts.append(
+                                f"drawtext=textfile='{txt_esc}':fontsize={past_fontsize}:fontcolor=black@0.3"
+                                f":x={margin_x}+1:y={line_y}+1:{font_spec}:enable='gte(t,{next_start:.3f})'"
+                            )
+                            filter_parts.append(
+                                f"drawtext=textfile='{txt_esc}':fontsize={past_fontsize}:fontcolor=white@0.7"
+                                f":borderw=3:bordercolor=black@0.5:x={margin_x}:y={line_y}:{font_spec}:enable='gte(t,{next_start:.3f})'"
+                            )
+
+                    filter_chain = ",".join(filter_parts)
+
+                    short_output = os.path.join(output_dir, f"{video_title}_ranking_{batch_idx + 1}.mp4")
+                    overlay_cmd = [
+                        'ffmpeg', '-y', '-i', concat_raw,
+                        '-vf', filter_chain,
+                        '-c:a', 'copy', '-c:v', 'libx264', '-preset', 'medium', '-crf', '18', '-pix_fmt', 'yuv420p',
+                        short_output
+                    ]
+
+                    overlay_result = subprocess.run(overlay_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+                    if os.path.exists(concat_raw):
+                        os.remove(concat_raw)
+                    for tf in title_files:
+                        if os.path.exists(tf):
+                            os.remove(tf)
+
+                    if overlay_result.returncode == 0:
+                        print(f"🏆 Ranking Short #{batch_idx + 1} ready: {short_output}")
+                    else:
+                        print(f"❌ Overlay failed for #{batch_idx + 1}: {overlay_result.stderr.decode()[:200]}")
+
+            else:
+                # --- NORMAL/VIRAL MODE: process each clip individually ---
+                for i, clip in enumerate(clips_data['shorts']):
+                    start = clip['start']
+                    end = clip['end']
+                    print(f"\n🎬 Processing Clip {i+1}: {start}s - {end}s")
+                    print(f"   Title: {clip.get('video_title_for_youtube_short', 'No Title')}")
+
+                    clip_filename = f"{video_title}_clip_{i+1}.mp4"
+                    clip_temp_path = os.path.join(output_dir, f"temp_{clip_filename}")
+                    clip_final_path = os.path.join(output_dir, clip_filename)
+
+                    cut_command = [
+                        'ffmpeg', '-y',
+                        '-ss', str(start), '-to', str(end),
+                        '-i', input_video,
+                        '-c:v', 'libx264', '-crf', '18', '-preset', 'fast', '-c:a', 'aac',
+                        clip_temp_path
+                    ]
+                    subprocess.run(cut_command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+                    force_gen = getattr(args, 'force_general', False)
+                    success = process_video_to_vertical(clip_temp_path, clip_final_path, force_general=force_gen)
+
+                    if success:
+                        print(f"   ✅ Clip {i+1} ready: {clip_final_path}")
+
+                    if os.path.exists(clip_temp_path):
+                        os.remove(clip_temp_path)
 
     # Clean up original if requested
     if args.url and not args.keep_original and os.path.exists(input_video):

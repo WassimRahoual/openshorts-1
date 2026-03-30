@@ -387,6 +387,41 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                             {clip.video_description_for_tiktok || clip.video_description_for_instagram}
                         </p>
                     </div>
+
+                    {/* Hashtags */}
+                    {(clip.hashtags_tiktok || clip.hashtags_instagram) && (
+                        <div className="bg-black/20 rounded-lg p-3 border border-white/5">
+                            <div className="flex items-center justify-between mb-2">
+                                <div className="flex items-center gap-2 text-[10px] font-bold text-zinc-400 uppercase tracking-wider">
+                                    <span className="text-lg leading-none">#</span>
+                                    <span>Hashtags</span>
+                                </div>
+                                <button
+                                    onClick={() => {
+                                        const hashtags = clip.hashtags_tiktok || clip.hashtags_instagram || '';
+                                        navigator.clipboard.writeText(hashtags);
+                                    }}
+                                    className="text-[10px] text-cyan-400 hover:text-cyan-300 flex items-center gap-1 transition-colors"
+                                    title="Copier les hashtags"
+                                >
+                                    <Copy size={10} />
+                                    Copier
+                                </button>
+                            </div>
+                            <div className="flex flex-wrap gap-1.5">
+                                {(clip.hashtags_tiktok || clip.hashtags_instagram || '').split(/\s+/).filter(h => h.startsWith('#')).map((tag, i) => (
+                                    <span
+                                        key={i}
+                                        onClick={() => navigator.clipboard.writeText(tag)}
+                                        className="text-[11px] px-2 py-0.5 bg-cyan-500/10 text-cyan-400 rounded-full border border-cyan-500/20 cursor-pointer hover:bg-cyan-500/20 transition-colors"
+                                        title="Cliquer pour copier"
+                                    >
+                                        {tag}
+                                    </span>
+                                ))}
+                            </div>
+                        </div>
+                    )}
                 </div>
 
                 {/* Error Message */}

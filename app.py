@@ -7,13 +7,14 @@ import shutil
 import glob
 import time
 import asyncio
+from urllib.parse import quote
 from dotenv import load_dotenv
 from typing import Dict, Optional, List
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
 
@@ -88,13 +89,26 @@ async def cleanup_jobs():
         try:
             await asyncio.sleep(300) # Check every 5 minutes
             now = time.time()
-            
+
             # Simple directory cleanup based on modification time
             # Check OUTPUT_DIR
             for job_id in os.listdir(OUTPUT_DIR):
                 job_path = os.path.join(OUTPUT_DIR, job_id)
                 if os.path.isdir(job_path):
-                    if now - os.path.getmtime(job_path) > JOB_RETENTION_SECONDS:
+                    # Skip jobs that are still processing
+                    if job_id in jobs and jobs[job_id].get('status') not in ('completed', 'failed'):
+                        continue
+                    # Use the NEWEST file's mtime inside the dir (not the dir itself)
+                    # This prevents premature cleanup of long-running jobs
+                    try:
+                        newest_mtime = max(
+                            os.path.getmtime(os.path.join(job_path, f))
+                            for f in os.listdir(job_path)
+                            if os.path.isfile(os.path.join(job_path, f))
+                        ) if os.listdir(job_path) else os.path.getmtime(job_path)
+                    except (ValueError, OSError):
+                        newest_mtime = os.path.getmtime(job_path)
+                    if now - newest_mtime > JOB_RETENTION_SECONDS:
                         print(f"🧹 Purging old job: {job_id}")
                         shutil.rmtree(job_path, ignore_errors=True)
                         if job_id in jobs:
@@ -177,8 +191,54 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount static files for serving videos
-app.mount("/videos", StaticFiles(directory=OUTPUT_DIR), name="videos")
+# Custom video endpoint with proper range-request support (fixes Content-Length mismatch)
+@app.get("/videos/{job_id}/{filename}")
+async def serve_video(job_id: str, filename: str, request: Request):
+    file_path = os.path.join(OUTPUT_DIR, job_id, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Video not found")
+    file_size = os.path.getsize(file_path)
+    range_header = request.headers.get("range")
+    if range_header:
+        # Parse range
+        range_val = range_header.strip().replace("bytes=", "")
+        start_str, end_str = range_val.split("-")
+        start = int(start_str)
+        end = int(end_str) if end_str else file_size - 1
+        end = min(end, file_size - 1)
+        chunk_size = end - start + 1
+        def iterfile():
+            with open(file_path, "rb") as f:
+                f.seek(start)
+                remaining = chunk_size
+                while remaining > 0:
+                    data = f.read(min(65536, remaining))
+                    if not data:
+                        break
+                    remaining -= len(data)
+                    yield data
+        return StreamingResponse(
+            iterfile(),
+            status_code=206,
+            media_type="video/mp4",
+            headers={
+                "Content-Range": f"bytes {start}-{end}/{file_size}",
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(chunk_size),
+            },
+        )
+    def iterfile_full():
+        with open(file_path, "rb") as f:
+            while chunk := f.read(65536):
+                yield chunk
+    return StreamingResponse(
+        iterfile_full(),
+        media_type="video/mp4",
+        headers={
+            "Content-Length": str(file_size),
+            "Accept-Ranges": "bytes",
+        },
+    )
 
 # Mount static files for serving thumbnails
 THUMBNAILS_DIR = os.path.join(OUTPUT_DIR, "thumbnails")
@@ -246,20 +306,28 @@ async def run_job(job_id, job_data):
                             data = json.load(f)
                             
                         base_name = os.path.basename(target_json).replace('_metadata.json', '')
-                        clips = data.get('shorts', [])
                         cost_analysis = data.get('cost_analysis')
-                        
-                        # Check which clips actually exist on disk
+                        job_mode = jobs[job_id].get('mode', 'ranking')
+
                         ready_clips = []
-                        for i, clip in enumerate(clips):
-                             clip_filename = f"{base_name}_clip_{i+1}.mp4"
-                             clip_path = os.path.join(output_dir, clip_filename)
-                             if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
-                                 # Checking if file is growing? For now assume if it exists and main.py moves it there, it's done.
-                                 # main.py writes to temp_... then moves to final name. So presence means ready!
-                                 clip['video_url'] = f"/videos/{job_id}/{clip_filename}"
-                                 ready_clips.append(clip)
-                        
+                        if job_mode == 'ranking':
+                            # Look for completed ranking Shorts (exclude intermediate _raw files)
+                            ranking_files = sorted([f for f in glob.glob(os.path.join(output_dir, f"{base_name}_ranking_*.mp4")) if '_ranking_raw' not in f])
+                            for i, rf in enumerate(ranking_files):
+                                fname = os.path.basename(rf)
+                                ready_clips.append({
+                                    'video_url': f"/videos/{job_id}/{quote(fname)}",
+                                    'video_title_for_youtube_short': f'Ranking Short #{i+1}',
+                                })
+                        else:
+                            clips = data.get('shorts', [])
+                            for i, clip in enumerate(clips):
+                                clip_filename = f"{base_name}_clip_{i+1}.mp4"
+                                clip_path = os.path.join(output_dir, clip_filename)
+                                if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
+                                    clip['video_url'] = f"/videos/{job_id}/{quote(clip_filename)}"
+                                    ready_clips.append(clip)
+
                         if ready_clips:
                              jobs[job_id]['result'] = {'clips': ready_clips, 'cost_analysis': cost_analysis}
             except Exception as e:
@@ -269,13 +337,12 @@ async def run_job(job_id, job_data):
         returncode = process.returncode
         
         if returncode == 0:
-            jobs[job_id]['status'] = 'completed'
             jobs[job_id]['logs'].append("Process finished successfully.")
-            
+
             # Start S3 upload in background (silent, non-blocking)
             loop = asyncio.get_event_loop()
             loop.run_in_executor(None, upload_job_artifacts, output_dir, job_id)
-            
+
             # Find result JSON
             json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
             if not json_files:
@@ -283,23 +350,40 @@ async def run_job(job_id, job_data):
                 if _relocate_root_job_artifacts(job_id, output_dir):
                     json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
             if json_files:
-                target_json = json_files[0] 
+                target_json = json_files[0]
                 with open(target_json, 'r') as f:
                     data = json.load(f)
-                
-                # Enhance result with video URLs
-                base_name = os.path.basename(target_json).replace('_metadata.json', '')
-                clips = data.get('shorts', [])
-                cost_analysis = data.get('cost_analysis')
 
-                for i, clip in enumerate(clips):
-                     clip_filename = f"{base_name}_clip_{i+1}.mp4"
-                     clip['video_url'] = f"/videos/{job_id}/{clip_filename}"
-                
+                base_name = os.path.basename(target_json).replace('_metadata.json', '')
+                cost_analysis = data.get('cost_analysis')
+                job_mode = jobs[job_id].get('mode', 'ranking')
+
+                if job_mode == 'ranking':
+                    # Ranking mode: look for _ranking_N.mp4 files (exclude intermediate _raw files)
+                    ranking_files = sorted([f for f in glob.glob(os.path.join(output_dir, f"{base_name}_ranking_*.mp4")) if '_ranking_raw' not in f])
+                    clips = []
+                    for i, rf in enumerate(ranking_files):
+                        fname = os.path.basename(rf)
+                        clips.append({
+                            'video_url': f"/videos/{job_id}/{quote(fname)}",
+                            'video_title_for_youtube_short': data.get('video_title_for_youtube_short', f'Ranking Short #{i+1}'),
+                            'video_description_for_tiktok': data.get('video_description_for_tiktok', ''),
+                            'video_description_for_instagram': data.get('video_description_for_instagram', ''),
+                            'hashtags_tiktok': data.get('hashtags_tiktok', ''),
+                            'hashtags_instagram': data.get('hashtags_instagram', ''),
+                        })
+                else:
+                    clips = data.get('shorts', [])
+                    for i, clip in enumerate(clips):
+                        clip_filename = f"{base_name}_clip_{i+1}.mp4"
+                        clip['video_url'] = f"/videos/{job_id}/{quote(clip_filename)}"
+
                 jobs[job_id]['result'] = {'clips': clips, 'cost_analysis': cost_analysis}
+
+                jobs[job_id]['status'] = 'completed'
             else:
-                 jobs[job_id]['status'] = 'failed'
-                 jobs[job_id]['logs'].append("No metadata file generated.")
+                jobs[job_id]['status'] = 'failed'
+                jobs[job_id]['logs'].append("No metadata file generated.")
         else:
             jobs[job_id]['status'] = 'failed'
             jobs[job_id]['logs'].append(f"Process failed with exit code {returncode}")
@@ -319,11 +403,16 @@ async def process_endpoint(
         raise HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
     
     # Handle JSON body manually for URL payload
+    mode = 'ranking'  # default
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type:
         body = await request.json()
         url = body.get("url")
-    
+        mode = body.get("mode", "ranking")
+    elif "multipart/form-data" in content_type:
+        form = await request.form()
+        mode = form.get("mode", "ranking")
+
     if not url and not file:
         raise HTTPException(status_code=400, detail="Must provide URL or File")
 
@@ -358,6 +447,9 @@ async def process_endpoint(
         cmd.extend(["-i", input_path])
 
     cmd.extend(["-o", job_output_dir])
+    cmd.extend(["--mode", mode])
+    if mode == 'ranking':
+        cmd.append("--force-general")
 
     # Enqueue Job
     jobs[job_id] = {
@@ -365,7 +457,8 @@ async def process_endpoint(
         'logs': [f"Job {job_id} queued."],
         'cmd': cmd,
         'env': env,
-        'output_dir': job_output_dir
+        'output_dir': job_output_dir,
+        'mode': mode,
     }
     
     await job_queue.put(job_id)
@@ -503,7 +596,7 @@ async def edit_clip(
         # Or return new URL and let frontend handle it?
         # Updating job result allows persistence if page refreshes.
         
-        new_video_url = f"/videos/{req.job_id}/{edited_filename}"
+        new_video_url = f"/videos/{req.job_id}/{quote(edited_filename)}"
         
         # Start a new "edited" clip entry or just update the current one?
         # Let's update the current one's video_url but keep backup?
@@ -623,12 +716,12 @@ async def add_subtitles(req: SubtitleRequest):
     # 3. Update Result and Metadata
     # Update InMemory Jobs
     if req.clip_index < len(job['result']['clips']):
-         job['result']['clips'][req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
+         job['result']['clips'][req.clip_index]['video_url'] = f"/videos/{req.job_id}/{quote(output_filename)}"
     
     # Update Metadata on Disk (Persistence)
     try:
         if req.clip_index < len(clips):
-            clips[req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
+            clips[req.clip_index]['video_url'] = f"/videos/{req.job_id}/{quote(output_filename)}"
             # Update the main data structure
             data['shorts'] = clips
             
@@ -642,7 +735,7 @@ async def add_subtitles(req: SubtitleRequest):
 
     return {
         "success": True,
-        "new_video_url": f"/videos/{req.job_id}/{output_filename}"
+        "new_video_url": f"/videos/{req.job_id}/{quote(output_filename)}"
     }
 
 class HookRequest(BaseModel):
@@ -710,12 +803,12 @@ async def add_hook(req: HookRequest):
     # Update Persistence (Same logic as subtitles)
     # Update InMemory Jobs
     if req.clip_index < len(job['result']['clips']):
-         job['result']['clips'][req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
+         job['result']['clips'][req.clip_index]['video_url'] = f"/videos/{req.job_id}/{quote(output_filename)}"
     
     # Update Metadata on Disk
     try:
         if req.clip_index < len(clips):
-            clips[req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
+            clips[req.clip_index]['video_url'] = f"/videos/{req.job_id}/{quote(output_filename)}"
             data['shorts'] = clips
             with open(json_files[0], 'w') as f:
                 json.dump(data, f, indent=4)
@@ -725,8 +818,87 @@ async def add_hook(req: HookRequest):
 
     return {
         "success": True,
-        "new_video_url": f"/videos/{req.job_id}/{output_filename}"
+        "new_video_url": f"/videos/{req.job_id}/{quote(output_filename)}"
     }
+
+
+class BatchRequest(BaseModel):
+    urls: List[str]
+
+batch_jobs: Dict[str, Dict] = {}
+
+@app.post("/api/batch")
+async def batch_process(
+    req: BatchRequest,
+    x_gemini_key: Optional[str] = Header(None, alias="X-Gemini-Key"),
+):
+    """Submit multiple YouTube URLs for batch processing."""
+    if not x_gemini_key:
+        raise HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
+
+    if not req.urls or len(req.urls) < 1:
+        raise HTTPException(status_code=400, detail="At least 1 URL required")
+
+    batch_id = str(uuid.uuid4())
+    job_ids = []
+
+    for url in req.urls:
+        job_id = str(uuid.uuid4())
+        job_output_dir = os.path.join(OUTPUT_DIR, job_id)
+        os.makedirs(job_output_dir, exist_ok=True)
+
+        jobs[job_id] = {
+            "status": "queued",
+            "logs": [],
+            "result": None,
+            "gemini_key": x_gemini_key,
+            "url": url,
+            "output_dir": job_output_dir,
+        }
+        job_ids.append(job_id)
+        await job_queue.put(job_id)
+
+    batch_jobs[batch_id] = {
+        "job_ids": job_ids,
+        "urls": req.urls,
+    }
+
+    return {
+        "batch_id": batch_id,
+        "job_ids": job_ids,
+    }
+
+@app.get("/api/batch/status/{batch_id}")
+async def batch_status(batch_id: str):
+    """Get status of all jobs in a batch."""
+    if batch_id not in batch_jobs:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    batch = batch_jobs[batch_id]
+    statuses = []
+
+    for job_id in batch["job_ids"]:
+        if job_id in jobs:
+            job = jobs[job_id]
+            statuses.append({
+                "job_id": job_id,
+                "status": job["status"],
+                "result": job.get("result"),
+            })
+        else:
+            statuses.append({
+                "job_id": job_id,
+                "status": "expired",
+            })
+
+    all_complete = all(s["status"] in ("complete", "error", "expired") for s in statuses)
+
+    return {
+        "batch_id": batch_id,
+        "overall_status": "complete" if all_complete else "processing",
+        "jobs": statuses,
+    }
+
 
 class TranslateRequest(BaseModel):
     job_id: str
@@ -806,12 +978,12 @@ async def translate_clip(
 
     # Update InMemory Jobs
     if req.clip_index < len(job['result']['clips']):
-         job['result']['clips'][req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
+         job['result']['clips'][req.clip_index]['video_url'] = f"/videos/{req.job_id}/{quote(output_filename)}"
 
     # Update Metadata on Disk
     try:
         if req.clip_index < len(clips):
-            clips[req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
+            clips[req.clip_index]['video_url'] = f"/videos/{req.job_id}/{quote(output_filename)}"
             data['shorts'] = clips
             with open(json_files[0], 'w') as f:
                 json.dump(data, f, indent=4)
@@ -821,7 +993,7 @@ async def translate_clip(
 
     return {
         "success": True,
-        "new_video_url": f"/videos/{req.job_id}/{output_filename}"
+        "new_video_url": f"/videos/{req.job_id}/{quote(output_filename)}"
     }
 
 class SocialPostRequest(BaseModel):

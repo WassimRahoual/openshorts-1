@@ -1,15 +1,21 @@
 import React, { useState } from 'react';
-import { Youtube, Upload, FileVideo, X } from 'lucide-react';
+import { Youtube, Upload, FileVideo, X, Plus, Trash2 } from 'lucide-react';
 
 export default function MediaInput({ onProcess, isProcessing }) {
     const [mode, setMode] = useState('url'); // 'url' | 'file'
-    const [url, setUrl] = useState('');
+    const [urls, setUrls] = useState(['']);
     const [file, setFile] = useState(null);
 
     const handleSubmit = (e) => {
         e.preventDefault();
-        if (mode === 'url' && url) {
-            onProcess({ type: 'url', payload: url });
+        if (mode === 'url') {
+            const validUrls = urls.map(u => u.trim()).filter(Boolean);
+            if (validUrls.length === 0) return;
+            if (validUrls.length === 1) {
+                onProcess({ type: 'url', payload: validUrls[0] });
+            } else {
+                onProcess({ type: 'urls', payload: validUrls });
+            }
         } else if (mode === 'file' && file) {
             onProcess({ type: 'file', payload: file });
         }
@@ -23,6 +29,14 @@ export default function MediaInput({ onProcess, isProcessing }) {
         }
     };
 
+    const addUrl = () => setUrls(prev => [...prev, '']);
+    const removeUrl = (i) => setUrls(prev => prev.filter((_, idx) => idx !== i));
+    const updateUrl = (i, val) => setUrls(prev => prev.map((u, idx) => idx === i ? val : u));
+
+    const hasValidInput = mode === 'url'
+        ? urls.some(u => u.trim())
+        : !!file;
+
     return (
         <div className="bg-surface border border-white/5 rounded-2xl p-6 animate-[fadeIn_0.6s_ease-out]">
             <div className="flex gap-4 mb-6 border-b border-white/5 pb-4">
@@ -30,8 +44,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     onClick={() => setMode('url')}
                     className={`flex items-center gap-2 pb-2 px-2 transition-all ${mode === 'url'
                         ? 'text-primary border-b-2 border-primary -mb-[17px]'
-                        : 'text-zinc-400 hover:text-white'
-                        }`}
+                        : 'text-zinc-400 hover:text-white'}`}
                 >
                     <Youtube size={18} />
                     YouTube URL
@@ -40,8 +53,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     onClick={() => setMode('file')}
                     className={`flex items-center gap-2 pb-2 px-2 transition-all ${mode === 'file'
                         ? 'text-primary border-b-2 border-primary -mb-[17px]'
-                        : 'text-zinc-400 hover:text-white'
-                        }`}
+                        : 'text-zinc-400 hover:text-white'}`}
                 >
                     <Upload size={18} />
                     Upload File
@@ -50,20 +62,38 @@ export default function MediaInput({ onProcess, isProcessing }) {
 
             <form onSubmit={handleSubmit}>
                 {mode === 'url' ? (
-                    <div className="space-y-4">
-                        <input
-                            type="url"
-                            value={url}
-                            onChange={(e) => setUrl(e.target.value)}
-                            placeholder="https://www.youtube.com/watch?v=..."
-                            className="input-field"
-                            required
-                        />
+                    <div className="space-y-2">
+                        {urls.map((url, i) => (
+                            <div key={i} className="flex gap-2 items-center">
+                                <input
+                                    type="url"
+                                    value={url}
+                                    onChange={(e) => updateUrl(i, e.target.value)}
+                                    placeholder="https://www.youtube.com/watch?v=..."
+                                    className="input-field flex-1"
+                                />
+                                {urls.length > 1 && (
+                                    <button
+                                        type="button"
+                                        onClick={() => removeUrl(i)}
+                                        className="p-2 text-zinc-500 hover:text-red-400 transition-colors"
+                                    >
+                                        <Trash2 size={16} />
+                                    </button>
+                                )}
+                            </div>
+                        ))}
+                        <button
+                            type="button"
+                            onClick={addUrl}
+                            className="flex items-center gap-1.5 text-xs text-zinc-500 hover:text-primary transition-colors mt-1 px-1"
+                        >
+                            <Plus size={14} /> Ajouter une URL
+                        </button>
                     </div>
                 ) : (
                     <div
-                        className={`border-2 border-dashed rounded-xl p-8 text-center transition-all ${file ? 'border-primary/50 bg-primary/5' : 'border-zinc-700 hover:border-zinc-500 bg-white/5'
-                            }`}
+                        className={`border-2 border-dashed rounded-xl p-8 text-center transition-all ${file ? 'border-primary/50 bg-primary/5' : 'border-zinc-700 hover:border-zinc-500 bg-white/5'}`}
                         onDragOver={(e) => e.preventDefault()}
                         onDrop={handleDrop}
                     >
@@ -71,11 +101,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                             <div className="flex items-center justify-center gap-3 text-white">
                                 <FileVideo className="text-primary" />
                                 <span className="font-medium">{file.name}</span>
-                                <button
-                                    type="button"
-                                    onClick={() => setFile(null)}
-                                    className="p-1 hover:bg-white/10 rounded-full"
-                                >
+                                <button type="button" onClick={() => setFile(null)} className="p-1 hover:bg-white/10 rounded-full">
                                     <X size={16} />
                                 </button>
                             </div>
@@ -97,17 +123,19 @@ export default function MediaInput({ onProcess, isProcessing }) {
 
                 <button
                     type="submit"
-                    disabled={isProcessing || (mode === 'url' && !url) || (mode === 'file' && !file)}
+                    disabled={isProcessing || !hasValidInput}
                     className="w-full btn-primary mt-6 flex items-center justify-center gap-2"
                 >
                     {isProcessing ? (
                         <>
                             <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                            Processing Video...
+                            Processing...
                         </>
                     ) : (
                         <>
-                            Generate Clips
+                            {mode === 'url' && urls.filter(u => u.trim()).length > 1
+                                ? `Générer ${urls.filter(u => u.trim()).length} Rankings`
+                                : 'Generate Clips'}
                         </>
                     )}
                 </button>

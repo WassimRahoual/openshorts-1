@@ -1,8 +1,23 @@
 import os
+import re
 import textwrap
 import subprocess
 import urllib.request
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
+
+def strip_emojis(text):
+    """Remove emoji characters that PIL/NotoSerif can't render."""
+    emoji_pattern = re.compile(
+        "[\U00010000-\U0010ffff"
+        "\U0001F600-\U0001F64F"
+        "\U0001F300-\U0001F5FF"
+        "\U0001F680-\U0001F6FF"
+        "\U0001F1E0-\U0001F1FF"
+        "\u2600-\u26FF"
+        "\u2700-\u27BF"
+        "]+", flags=re.UNICODE
+    )
+    return emoji_pattern.sub('', text).strip()
 
 FONT_URL = "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSerif/NotoSerif-Bold.ttf"
 FONT_DIR = "fonts"
@@ -15,9 +30,8 @@ def download_font_if_needed():
     if not os.path.exists(FONT_PATH):
         print(f"⬇️ Downloading font from {FONT_URL}...")
         try:
-            # Add user agent to avoid 403s slightly
             req = urllib.request.Request(
-                FONT_URL, 
+                FONT_URL,
                 headers={'User-Agent': 'Mozilla/5.0'}
             )
             with urllib.request.urlopen(req) as response, open(FONT_PATH, 'wb') as out_file:
@@ -221,7 +235,7 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
             '-i', img_path,
             '-filter_complex', f"[0:v][1:v]overlay={overlay_x}:{overlay_y}",
             '-c:a', 'copy',
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
+            '-c:v', 'libx264', '-preset', 'medium', '-crf', '18', '-pix_fmt', 'yuv420p',
             output_path
         ]
         
@@ -239,3 +253,181 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
         # Cleanup temp image
         if os.path.exists(hook_filename):
             os.remove(hook_filename)
+
+
+def add_ranking_with_title_to_video(video_path, number, title, output_path, position="top-left", style="circle"):
+    """
+    Burns ranking number + title directly onto video using FFmpeg drawtext.
+    Uses textfile= instead of text= to avoid shell/escaping issues.
+    Style: large bold "TOP N" just above title, title text near bottom.
+    """
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Video {video_path} not found")
+
+    try:
+        cmd = ['ffprobe', '-v', 'error', '-show_entries', 'stream=width,height', '-of', 'csv=s=x:p=0', video_path]
+        res = subprocess.check_output(cmd).decode().strip()
+        dims = res.split('\n')[0].split('x')
+        video_width = int(dims[0])
+        video_height = int(dims[1])
+    except Exception:
+        video_width = 1080
+        video_height = 1920
+
+    out_dir = os.path.dirname(os.path.abspath(output_path))
+
+    # Write text to temp files to avoid ALL escaping issues
+    top_txt_file = os.path.join(out_dir, f"temp_top_{number}.txt")
+    title_txt_file = os.path.join(out_dir, f"temp_title_{number}.txt")
+    with open(top_txt_file, 'w', encoding='utf-8') as f:
+        f.write(f"TOP {number}")
+    # Clean title: strip emojis, limit length
+    clean_title = strip_emojis(title).strip()
+    if not clean_title:
+        clean_title = f"TOP {number}"
+    with open(title_txt_file, 'w', encoding='utf-8') as f:
+        f.write(clean_title)
+
+    # Font sizes relative to video width
+    top_fontsize = int(video_width * 0.12)
+    title_fontsize = int(video_width * 0.045)
+
+    # Use Liberation Sans Bold (installed via fonts-liberation in Docker)
+    font_spec = "font=Liberation Sans Bold"
+
+    # Position: title near bottom, TOP N just above title
+    title_y = int(video_height * 0.82)
+    top_y = title_y - top_fontsize - int(video_height * 0.015)
+
+    # Escape file paths for FFmpeg filter syntax
+    top_path_esc = top_txt_file.replace("\\", "/").replace(":", "\\:").replace("'", "'\\''")
+    title_path_esc = title_txt_file.replace("\\", "/").replace(":", "\\:").replace("'", "'\\''")
+
+    filter_parts = []
+
+    # Layer 1: TOP N drop shadow
+    filter_parts.append(
+        f"drawtext=textfile='{top_path_esc}'"
+        f":fontsize={top_fontsize}:fontcolor=black@0.5"
+        f":borderw=0:x=(w-text_w)/2+4:y={top_y}+4"
+        f":{font_spec}"
+    )
+    # Layer 2: TOP N main (white, thick black outline)
+    filter_parts.append(
+        f"drawtext=textfile='{top_path_esc}'"
+        f":fontsize={top_fontsize}:fontcolor=white"
+        f":borderw=7:bordercolor=black"
+        f":x=(w-text_w)/2:y={top_y}"
+        f":{font_spec}"
+    )
+    # Layer 3: Title drop shadow
+    filter_parts.append(
+        f"drawtext=textfile='{title_path_esc}'"
+        f":fontsize={title_fontsize}:fontcolor=black@0.6"
+        f":borderw=0:x=(w-text_w)/2+3:y={title_y}+3"
+        f":{font_spec}"
+    )
+    # Layer 4: Title main (white, black outline)
+    filter_parts.append(
+        f"drawtext=textfile='{title_path_esc}'"
+        f":fontsize={title_fontsize}:fontcolor=white"
+        f":borderw=4:bordercolor=black"
+        f":x=(w-text_w)/2:y={title_y}"
+        f":{font_spec}"
+    )
+
+    filter_chain = ",".join(filter_parts)
+
+    print(f"🏆 Overlaying TOP {number} + title: '{clean_title[:40]}'")
+
+    ffmpeg_cmd = [
+        'ffmpeg', '-y',
+        '-i', video_path,
+        '-vf', filter_chain,
+        '-c:a', 'copy',
+        '-c:v', 'libx264', '-preset', 'medium', '-crf', '18', '-pix_fmt', 'yuv420p',
+        output_path
+    ]
+
+    try:
+        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        print(f"✅ TOP {number} + title burned into {output_path}")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"❌ FFmpeg Error: {e.stderr.decode()[:300] if e.stderr else 'Unknown'}")
+        raise e
+    finally:
+        for f in [top_txt_file, title_txt_file]:
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+
+
+def add_ranking_number_to_video(video_path, number, output_path, position="top-left", style="circle"):
+    """
+    Overlays a ranking number on the video.
+    position: 'top-left', 'top-right'
+    """
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Video {video_path} not found")
+
+    # Probe video dimensions
+    try:
+        cmd = ['ffprobe', '-v', 'error', '-show_entries', 'stream=width,height', '-of', 'csv=s=x:p=0', video_path]
+        res = subprocess.check_output(cmd).decode().strip()
+        dims = res.split('\n')[0].split('x')
+        video_width = int(dims[0])
+        video_height = int(dims[1])
+    except Exception:
+        video_width = 1080
+        video_height = 1920
+
+    # Use absolute path in same dir as output to avoid CWD issues in Docker
+    safe_basename = os.path.basename(video_path).replace(' ', '_')
+    rank_filename = os.path.join(
+        os.path.dirname(os.path.abspath(output_path)),
+        f"temp_rank_{number}_{safe_basename}.png"
+    )
+
+    try:
+        img_path, img_w, img_h = create_ranking_number_image(
+            number, video_width, rank_filename, style=style
+        )
+
+        if not os.path.exists(img_path):
+            raise FileNotFoundError(f"Ranking PNG was not created: {img_path}")
+
+        # Position: 5% margin from edges
+        margin = int(video_width * 0.03)
+        if position == "top-right":
+            overlay_x = video_width - img_w - margin
+        else:
+            overlay_x = margin
+        overlay_y = margin
+
+        print(f"🏆 Overlaying rank #{number} at {overlay_x},{overlay_y}")
+
+        ffmpeg_cmd = [
+            'ffmpeg', '-y',
+            '-i', video_path,
+            '-i', img_path,
+            '-filter_complex', f"[0:v][1:v]overlay={overlay_x}:{overlay_y}",
+            '-c:a', 'copy',
+            '-c:v', 'libx264', '-preset', 'medium', '-crf', '18', '-pix_fmt', 'yuv420p',
+            output_path
+        ]
+
+        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        print(f"✅ Rank #{number} added to {output_path}")
+        return True
+
+    except subprocess.CalledProcessError as e:
+        print(f"❌ FFmpeg Error: {e.stderr.decode() if e.stderr else 'Unknown'}")
+        raise e
+    finally:
+        if os.path.exists(rank_filename):
+            os.remove(rank_filename)
+
+

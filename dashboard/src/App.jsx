@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Upload, FileVideo, Sparkles, Youtube, Instagram, Share2, LogOut, ChevronDown, Check, Activity, LayoutDashboard, Settings, PlusCircle, History, Menu, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw } from 'lucide-react';
+import { Upload, FileVideo, Sparkles, Youtube, Instagram, Share2, LogOut, ChevronDown, Check, Activity, LayoutDashboard, Settings, PlusCircle, History, Menu, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Film } from 'lucide-react';
 import KeyInput from './components/KeyInput';
 import MediaInput from './components/MediaInput';
 import ResultCard from './components/ResultCard';
@@ -160,12 +160,14 @@ function App() {
   const [jobId, setJobId] = useState(null);
   const [status, setStatus] = useState('idle'); // idle, processing, complete, error
   const [results, setResults] = useState(null);
+  const [batchJobs, setBatchJobs] = useState([]); // [{url, jobId, status, results}]
   const [logs, setLogs] = useState([]);
   const [logsVisible, setLogsVisible] = useState(true);
   const [processingMedia, setProcessingMedia] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard'); // dashboard, settings
 
   const [sessionRecovered, setSessionRecovered] = useState(false);
+  const [mode, setMode] = useState('ranking'); // 'normal' | 'ranking'
 
   // Sync state for original video playback
   const [syncedTime, setSyncedTime] = useState(0);
@@ -263,7 +265,7 @@ function App() {
 
   useEffect(() => {
     let interval;
-    if ((status === 'processing' || status === 'completed') && jobId) {
+    if ((status === 'processing' || status === 'compiling') && jobId) {
       interval = setInterval(async () => {
         try {
           const data = await pollJob(jobId);
@@ -274,7 +276,9 @@ function App() {
             setResults(data.result);
           }
 
-          if (data.status === 'completed') {
+          if (data.status === 'compiling') {
+            setStatus('compiling');
+          } else if (data.status === 'completed') {
             setStatus('complete');
             clearInterval(interval);
           } else if (data.status === 'failed') {
@@ -294,6 +298,29 @@ function App() {
     return () => clearInterval(interval);
   }, [status, jobId]);
 
+  // Batch jobs polling
+  useEffect(() => {
+    if (batchJobs.length === 0) return;
+    const pending = batchJobs.filter(j => j.jobId && j.status === 'processing');
+    if (pending.length === 0) return;
+
+    const interval = setInterval(async () => {
+      const updated = await Promise.all(batchJobs.map(async (j) => {
+        if (!j.jobId || j.status !== 'processing') return j;
+        try {
+          const data = await pollJob(j.jobId);
+          if (data.status === 'completed') return { ...j, status: 'complete', results: data.result };
+          if (data.status === 'failed') return { ...j, status: 'error' };
+        } catch { return { ...j, status: 'error' }; }
+        return j;
+      }));
+      setBatchJobs(updated);
+      if (updated.every(j => j.status === 'complete' || j.status === 'error')) {
+        setStatus('complete');
+      }
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [batchJobs]);
 
   const fetchUserProfiles = async () => {
     if (!uploadPostKey) return;
@@ -318,11 +345,44 @@ function App() {
     }
   };
 
+  const startSingleJob = async (url) => {
+    const headers = { 'X-Gemini-Key': apiKey, 'Content-Type': 'application/json' };
+    const res = await fetch(getApiUrl('/api/process'), {
+      method: 'POST', headers,
+      body: JSON.stringify({ url, mode })
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    return data.job_id;
+  };
+
   const handleProcess = async (data) => {
-    if (!apiKey) {
-      setShowKeyModal(true);
+    if (!apiKey) { setShowKeyModal(true); return; }
+
+    // Multi-URL batch mode
+    if (data.type === 'urls') {
+      setBatchJobs(data.payload.map(url => ({ url, jobId: null, status: 'queued', results: null })));
+      setStatus('processing');
+      setResults(null);
+      setProcessingMedia(null);
+      setLogs(["Lancement de " + data.payload.length + " jobs en parallèle..."]);
+
+      const startedJobs = await Promise.all(
+        data.payload.map(async (url, i) => {
+          try {
+            const jid = await startSingleJob(url);
+            return { url, jobId: jid, status: 'processing', results: null };
+          } catch (e) {
+            return { url, jobId: null, status: 'error', results: null };
+          }
+        })
+      );
+      setBatchJobs(startedJobs);
       return;
     }
+
+    // Single job mode (existing flow)
+    setBatchJobs([]);
     setStatus('processing');
     setLogs(["Starting process..."]);
     setResults(null);
@@ -334,10 +394,11 @@ function App() {
 
       if (data.type === 'url') {
         headers['Content-Type'] = 'application/json';
-        body = JSON.stringify({ url: data.payload });
+        body = JSON.stringify({ url: data.payload, mode });
       } else {
         const formData = new FormData();
         formData.append('file', data.payload);
+        formData.append('mode', mode);
         body = formData;
       }
 
@@ -713,6 +774,39 @@ function App() {
                   </p>
                 </div>
 
+                {/* Mode Selector */}
+                <div className="grid grid-cols-2 gap-3 mb-4">
+                  <button
+                    onClick={() => setMode('normal')}
+                    className={`flex flex-col items-start gap-1.5 p-4 rounded-xl border transition-all text-left ${
+                      mode === 'normal'
+                        ? 'bg-white/10 border-white/30 text-white'
+                        : 'bg-white/3 border-white/8 text-zinc-500 hover:bg-white/6 hover:border-white/15'
+                    }`}
+                  >
+                    <div className="flex items-center gap-2">
+                      <Sparkles size={15} className={mode === 'normal' ? 'text-white' : 'text-zinc-600'} />
+                      <span className="text-sm font-bold">Normal</span>
+                    </div>
+                    <p className="text-[11px] leading-tight opacity-70">Extrait le meilleur moment viral en un seul clip</p>
+                  </button>
+                  <button
+                    onClick={() => setMode('ranking')}
+                    className={`flex flex-col items-start gap-1.5 p-4 rounded-xl border transition-all text-left ${
+                      mode === 'ranking'
+                        ? 'bg-red-500/15 border-red-500/50 text-white'
+                        : 'bg-white/3 border-white/8 text-zinc-500 hover:bg-white/6 hover:border-white/15'
+                    }`}
+                  >
+                    <div className="flex items-center gap-2">
+                      <Film size={15} className={mode === 'ranking' ? 'text-red-400' : 'text-zinc-600'} />
+                      <span className="text-sm font-bold">Ranking</span>
+                      <span className="text-[9px] font-bold px-1.5 py-0.5 rounded-full bg-red-500/30 text-red-300 border border-red-500/40">RankZilla</span>
+                    </div>
+                    <p className="text-[11px] leading-tight opacity-70">Compile tous les moments en un Short classé #N→#1</p>
+                  </button>
+                </div>
+
                 <MediaInput onProcess={handleProcess} isProcessing={status === 'processing'} />
 
                 <div className="flex items-center justify-center gap-8 text-zinc-500 text-sm">
@@ -735,10 +829,11 @@ function App() {
                     <Activity className={`text-primary ${status === 'processing' ? 'animate-pulse' : ''}`} size={20} />
                     Live Analysis
                   </h2>
-                  <span className={`text-xs px-2 py-1 rounded-full border ${status === 'processing' ? 'bg-primary/10 border-primary/20 text-primary' :
+                  <span className={`text-xs px-2 py-1 rounded-full border ${
+                    status === 'processing' ? 'bg-primary/10 border-primary/20 text-primary' :
                     status === 'complete' ? 'bg-green-500/10 border-green-500/20 text-green-400' :
-                      'bg-red-500/10 border-red-500/20 text-red-400'
-                    }`}>
+                    'bg-red-500/10 border-red-500/20 text-red-400'
+                  }`}>
                     {status.toUpperCase()}
                   </span>
                 </div>
@@ -784,8 +879,8 @@ function App() {
               <div className={`${status === 'complete' ? 'w-full md:w-[70%] lg:w-[75%]' : 'w-full md:w-[45%] lg:w-[40%]'} h-full flex flex-col bg-background p-6 transition-all duration-700 ease-in-out`}>
                 <h2 className="text-lg font-semibold mb-6 flex items-center gap-2 shrink-0">
                   <Sparkles className="text-yellow-400" size={20} />
-                  Generated Shorts
-                  {results?.clips?.length > 0 && (
+                  {mode === 'ranking' ? 'Ranking Video' : 'Generated Shorts'}
+                  {results?.clips?.length > 0 && mode !== 'ranking' && (
                     <span className="text-xs bg-white/10 text-white px-2 py-0.5 rounded-full ml-auto">
                       {results.clips.length} Clips
                     </span>
@@ -798,7 +893,31 @@ function App() {
                 </h2>
 
                 <div className="flex-1 overflow-y-auto custom-scrollbar p-1">
-                  {results && results.clips && results.clips.length > 0 ? (
+                  {/* Batch mode: show multiple ranking videos */}
+                  {batchJobs.length > 0 ? (
+                    <div className="space-y-6 pb-10">
+                      {batchJobs.map((j, i) => (
+                        <div key={i} className="border border-white/10 rounded-xl p-4 bg-white/3">
+                          <p className="text-xs text-zinc-400 mb-2 truncate">#{i+1} — {j.url}</p>
+                          {j.status === 'processing' || j.status === 'queued' ? (
+                            <div className="flex items-center gap-2 text-zinc-500 text-sm">
+                              <div className="w-4 h-4 border-2 border-zinc-600 border-t-primary rounded-full animate-spin" />
+                              En cours...
+                            </div>
+                          ) : j.status === 'error' ? (
+                            <p className="text-red-400 text-sm">Erreur</p>
+                          ) : j.results?.ranking_url ? (
+                            <div className="flex flex-col items-center gap-3">
+                              <video src={getApiUrl(j.results.ranking_url)} controls className="w-full max-w-xs rounded-lg" style={{ aspectRatio: '9/16' }} />
+                              <a href={getApiUrl(j.results.ranking_url)} download className="text-xs bg-red-500 hover:bg-red-400 text-white px-3 py-1.5 rounded-lg font-bold transition-colors">
+                                ⬇ Télécharger
+                              </a>
+                            </div>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
+                  ) : results?.clips?.length > 0 ? (
                     <div className={`grid gap-4 pb-10 ${status === 'complete' ? 'grid-cols-1 xl:grid-cols-2' : 'grid-cols-1'}`}>
                       {results.clips.map((clip, i) => (
                         <ResultCard
@@ -901,6 +1020,7 @@ function App() {
           </div>
         </div>
       )}
+
     </div>
   );
 }

@@ -165,11 +165,20 @@ def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16,
     elif align_lower == 'bottom':
         ass_alignment = 2
 
-    # Font size scaling for ASS virtual resolution (PlayResY=288 default)
-    # For vertical 1080x1920 video, we need larger text for readability
-    final_fontsize = int(fontsize * 0.85)
-    if final_fontsize < 10:
-        final_fontsize = 10
+    # Get video resolution to scale font size properly
+    try:
+        probe = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+             '-show_entries', 'stream=width,height', '-of', 'csv=p=0', video_path],
+            capture_output=True, text=True
+        )
+        vid_w, vid_h = [int(x) for x in probe.stdout.strip().split(',')]
+    except Exception:
+        vid_w, vid_h = 1080, 1920
+
+    # Scale fontsize relative to video height (base: 48px at 1920h)
+    final_fontsize = max(36, int(48 * vid_h / 1920))
+    print(f"   📝 Subtitle fontsize: {final_fontsize} (video: {vid_w}x{vid_h})")
 
     # Path handling for FFmpeg filter syntax
     safe_srt_path = srt_path.replace('\\', '/').replace(':', '\\:')
@@ -190,6 +199,10 @@ def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16,
 
     back_colour = hex_to_ass_color("#000000", 0.0)
 
+    # Scale margin and outline to video resolution
+    margin_v = max(20, int(40 * vid_h / 1920))
+    scaled_outline = max(2, int(outline_width * vid_h / 1920 * 2))
+
     style_string = (
         f"Alignment={ass_alignment},"
         f"Fontname={font_name},"
@@ -198,10 +211,12 @@ def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16,
         f"OutlineColour={outline_colour},"
         f"BackColour={back_colour},"
         f"BorderStyle={border_style},"
-        f"Outline={outline_width},"
+        f"Outline={scaled_outline},"
         f"Shadow=0,"
-        f"MarginV=25,"
-        f"Bold=1"
+        f"MarginV={margin_v},"
+        f"Bold=1,"
+        f"PlayResX={vid_w},"
+        f"PlayResY={vid_h}"
     )
 
     cmd = [
@@ -209,7 +224,7 @@ def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16,
         '-i', video_path,
         '-vf', f"subtitles='{safe_srt_path}':force_style='{style_string}'",
         '-c:a', 'copy',
-        '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+        '-c:v', 'libx264', '-preset', 'medium', '-crf', '18', '-pix_fmt', 'yuv420p',
         output_path
     ]
 
