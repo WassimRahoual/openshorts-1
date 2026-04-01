@@ -170,6 +170,7 @@ function App() {
 
   const [sessionRecovered, setSessionRecovered] = useState(false);
   const [mode, setMode] = useState('ranking'); // 'normal' | 'ranking'
+  const [geminiModel, setGeminiModel] = useState(() => localStorage.getItem('gemini_model') || 'gemini-2.5-flash');
 
   // Sync state for original video playback
   const [syncedTime, setSyncedTime] = useState(0);
@@ -237,6 +238,10 @@ function App() {
     // For now keeping gemini plain for compatibility unless requested.
     if (apiKey) localStorage.setItem('gemini_key', apiKey);
   }, [apiKey]);
+
+  useEffect(() => {
+    localStorage.setItem('gemini_model', geminiModel);
+  }, [geminiModel]);
 
   useEffect(() => {
     if (uploadPostKey) {
@@ -348,7 +353,7 @@ function App() {
   };
 
   const startSingleJob = async (url) => {
-    const headers = { 'X-Gemini-Key': apiKey, 'Content-Type': 'application/json' };
+    const headers = { 'X-Gemini-Key': apiKey, 'X-Gemini-Model': geminiModel, 'Content-Type': 'application/json' };
     const res = await fetch(getApiUrl('/api/process'), {
       method: 'POST', headers,
       body: JSON.stringify({ url, mode })
@@ -392,7 +397,7 @@ function App() {
 
     try {
       let body;
-      const headers = { 'X-Gemini-Key': apiKey };
+      const headers = { 'X-Gemini-Key': apiKey, 'X-Gemini-Model': geminiModel };
 
       if (data.type === 'url') {
         headers['Content-Type'] = 'application/json';
@@ -406,7 +411,7 @@ function App() {
 
       const res = await fetch(getApiUrl('/api/process'), {
         method: 'POST',
-        headers: data.type === 'url' ? headers : { 'X-Gemini-Key': apiKey },
+        headers: data.type === 'url' ? headers : { 'X-Gemini-Key': apiKey, 'X-Gemini-Model': geminiModel },
         body
       });
 
@@ -606,6 +611,51 @@ function App() {
                 </div>
               </div>
               <KeyInput onKeySet={setApiKey} savedKey={apiKey} />
+
+              <div className="glass-panel p-6 mt-8">
+                <div className="flex items-center justify-between mb-4">
+                  <h2 className="text-lg font-semibold">Gemini Model</h2>
+                </div>
+                <p className="text-xs text-zinc-500 mb-4 leading-relaxed">
+                  Select which Gemini model to use for AI analysis. More powerful models give better results but have lower free-tier limits.
+                </p>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  {[
+                    { id: 'gemini-2.5-pro', name: '2.5 Pro', desc: 'Most intelligent', badge: '25 req/day free', rgb: '168,85,247' },
+                    { id: 'gemini-2.5-flash', name: '2.5 Flash', desc: 'Best balance', badge: '500 req/day free', rgb: '59,130,246' },
+                    { id: 'gemini-2.0-flash', name: '2.0 Flash', desc: 'Fastest & cheapest', badge: '1500 req/day free', rgb: '34,197,94' },
+                  ].map(m => (
+                    <button
+                      key={m.id}
+                      onClick={() => setGeminiModel(m.id)}
+                      className={`p-4 rounded-xl border transition-all text-left ${
+                        geminiModel === m.id ? 'ring-1' : 'border-white/10 hover:border-white/20 hover:bg-white/5'
+                      }`}
+                      style={geminiModel === m.id ? {
+                        borderColor: `rgba(${m.rgb},0.5)`,
+                        backgroundColor: `rgba(${m.rgb},0.1)`,
+                        boxShadow: `0 0 0 1px rgba(${m.rgb},0.3)`
+                      } : {}}
+                    >
+                      <div className="flex items-center justify-between mb-1">
+                        <span className="font-semibold text-sm text-white">{m.name}</span>
+                        {geminiModel === m.id && <Check size={14} className="text-green-400" />}
+                      </div>
+                      <p className="text-[11px] text-zinc-400">{m.desc}</p>
+                      <span
+                        className="inline-block mt-2 text-[10px] px-2 py-0.5 rounded-full"
+                        style={{
+                          backgroundColor: `rgba(${m.rgb},0.1)`,
+                          color: `rgb(${m.rgb})`,
+                          border: `1px solid rgba(${m.rgb},0.2)`
+                        }}
+                      >
+                        {m.badge}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
 
               <div className="glass-panel p-6 mt-8">
                 <div className="flex items-center justify-between mb-4">
@@ -846,6 +896,12 @@ function App() {
                 </div>
 
                 <MediaInput onProcess={handleProcess} isProcessing={status === 'processing'} />
+
+                <div className="flex items-center justify-center gap-2 text-zinc-600 text-[11px]">
+                  <Sparkles size={12} />
+                  <span>Model: <strong className="text-zinc-400">{geminiModel}</strong></span>
+                  <button onClick={() => setActiveTab('settings')} className="text-blue-500 hover:text-blue-400 underline underline-offset-2">change</button>
+                </div>
 
                 <div className="flex items-center justify-center gap-8 text-zinc-500 text-sm">
                   <span className="flex items-center gap-2"><Youtube size={16} /> YouTube</span>

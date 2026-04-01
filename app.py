@@ -430,6 +430,8 @@ async def process_endpoint(
     cmd = ["python", "-u", "main.py"] # -u for unbuffered
     env = os.environ.copy()
     env["GEMINI_API_KEY"] = api_key # Override with key from request
+    gemini_model = request.headers.get("X-Gemini-Model", "gemini-2.5-flash")
+    env["GEMINI_MODEL"] = gemini_model
     
     if url:
         cmd.extend(["-u", url])

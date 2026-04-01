@@ -1093,8 +1093,7 @@ def get_viral_clips(transcript_result, video_duration):
 
     client = genai.Client(api_key=api_key)
     
-    # We use gemini-2.5-flash as requested.
-    model_name = 'gemini-2.5-flash' 
+    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
     
     print(f"🤖  Initializing Gemini with model: {model_name}")
 
@@ -1189,7 +1188,7 @@ def get_ranking_clips(transcript_result, video_duration, num_clips=6, scene_boun
         return None
 
     client = genai.Client(api_key=api_key)
-    model_name = 'gemini-2.5-flash'
+    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
     words = []
     for segment in transcript_result['segments']:
@@ -1404,7 +1403,7 @@ def refine_ranking_titles_with_frames(video_path, clips, api_key):
     print(f"   🎯 Refining {len(clips)} ranking titles with frame extraction...")
 
     client = genai.Client(api_key=api_key)
-    model_name = 'gemini-2.5-flash'
+    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -1520,7 +1519,7 @@ def get_short_metadata(transcript_result, video_duration):
         return None
 
     client = genai.Client(api_key=api_key)
-    model_name = 'gemini-2.5-flash'
+    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
     prompt = GEMINI_SHORT_PROMPT_TEMPLATE.format(
         video_duration=round(video_duration, 3),
