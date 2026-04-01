@@ -8,6 +8,8 @@ import ProcessingAnimation from './components/ProcessingAnimation';
 import ThumbnailStudio from './components/ThumbnailStudio';
 import SaaShortsTab from './components/SaaShortsTab';
 import UGCGallery from './components/UGCGallery';
+import RedditFeed from './components/RedditFeed';
+import CartoonStoriesTab from './components/CartoonStoriesTab';
 import { getApiUrl } from './config';
 
 // Enhanced "Encryption" using XOR + Base64 with a Salt
@@ -456,11 +458,27 @@ function App() {
         </button>
 
         <button
+          onClick={() => setActiveTab('cartoon')}
+          className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'cartoon' ? 'bg-pink-500/10 text-pink-400' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
+        >
+          <Film size={20} />
+          <span className="font-medium hidden lg:block">Cartoon Stories</span>
+        </button>
+
+        <button
           onClick={() => setActiveTab('ugc-gallery')}
           className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'ugc-gallery' ? 'bg-violet-500/10 text-violet-400' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
         >
           <LayoutGrid size={20} />
           <span className="font-medium hidden lg:block">UGC Gallery</span>
+        </button>
+
+        <button
+          onClick={() => setActiveTab('reddit')}
+          className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'reddit' ? 'bg-orange-500/10 text-orange-400' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
+        >
+          <RotateCcw size={20} />
+          <span className="font-medium hidden lg:block">Reddit Fails</span>
         </button>
 
         <button
@@ -746,9 +764,29 @@ function App() {
             <SaaShortsTab geminiApiKey={apiKey} elevenLabsKey={elevenLabsKey} falKey={falKey} uploadPostKey={uploadPostKey} uploadUserId={uploadUserId} />
           )}
 
+          {/* View: Cartoon Stories */}
+          {activeTab === 'cartoon' && (
+            <CartoonStoriesTab geminiApiKey={apiKey} elevenLabsKey={elevenLabsKey} falKey={falKey} />
+          )}
+
           {/* View: UGC Gallery */}
           {activeTab === 'ugc-gallery' && (
             <UGCGallery />
+          )}
+
+          {/* View: Reddit Fails */}
+          {activeTab === 'reddit' && (
+            <RedditFeed
+              geminiApiKey={apiKey}
+              onProcessStart={(jobId, title, previewUrl) => {
+                setJobId(jobId);
+                setStatus('processing');
+                setResults(null);
+                setLogs([`Processing Reddit video: ${title}`]);
+                setProcessingMedia(previewUrl ? { type: 'image', src: previewUrl } : null);
+                setActiveTab('dashboard');
+              }}
+            />
           )}
 
           {/* View: Thumbnails */}

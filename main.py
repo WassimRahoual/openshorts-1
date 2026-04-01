@@ -50,6 +50,9 @@ WORDS_JSON (array of {{w, s, e}} where s/e are seconds):
 
 STRICT EXCLUSIONS:
 - No generic intros/outros or purely sponsorship segments unless they contain the hook.
+- No transition scenes (animated transitions, logo bumpers, "subscribe" screens, countdowns, black/white frames between segments).
+- No end screens, credit rolls, or "thanks for watching" segments.
+- Only select moments with REAL CONTENT (someone talking, demonstrating, reacting, or performing).
 - No clips < 15 s or > 60 s.
 
 OUTPUT — RETURN ONLY VALID JSON (no markdown, no comments). Order clips by predicted performance (best to worst). In the descriptions, ALWAYS include a CTA like "Follow me and comment X and I'll send you the workflow" (especially if discussing an n8n workflow):
@@ -81,6 +84,7 @@ WHAT TO PICK:
 - STRONGLY PREFER longer scenes (6-15 seconds) that show the full setup before the fail
 - If a scene is short (under 5s), only pick it if it's EXTREMELY funny
 - SKIP: boring/dark/static footage, talking heads, intros/outros, mildly amusing moments
+- SKIP: transition scenes (animated transitions, logo bumpers, "subscribe" screens, countdowns, black/white frames between segments), end screens, credit rolls, "thanks for watching" segments
 
 VIDEO_DURATION_SECONDS: {video_duration}
 
@@ -91,6 +95,7 @@ VIDEO_DURATION_SECONDS: {video_duration}
 RULES:
 - Select scenes by SCENE ID. Do NOT invent timestamps.
 - Each TOP = ONE scene only.
+- ⚠️ EVERY scene_id MUST BE UNIQUE — NEVER select the same scene twice. Each clip must come from a DIFFERENT scene. If you run out of good scenes, return fewer clips rather than duplicating.
 - trim_start = scene start time, trim_end = scene end time. USE THE FULL SCENE. Do NOT trim shorter — every second of buildup matters.
 - PREFER longer scenes. Short scenes (under 5s) usually lack buildup and are less funny.
 - Position {num_clips} = least impressive. Position 1 = BEST clip.
@@ -128,10 +133,15 @@ You are selecting the {num_clips} best clips from a FAIL COMPILATION for a "TOP 
 
 ⚠️ This is a COMPILATION of SEPARATE short clips. The transcript is mostly reactions and background noise — DO NOT choose moments based on what is SAID. Choose based on where PHYSICAL ACTIONS happen (falls, crashes, fails, surprises).
 
+SKIP THESE — they are NOT valid clips:
+- Intro/outro sequences, transition scenes, animated logos, "subscribe" screens, countdowns
+- Black/white frames between segments, end screens, credit rolls
+- Only select moments with REAL VISUAL ACTION happening.
+
 TIMESTAMP RULES:
 - Absolute seconds, up to 3 decimals. 0 ≤ start < end ≤ VIDEO_DURATION_SECONDS.
 - Each clip: 5-10 seconds.
-- NON-OVERLAPPING clips covering distinct moments.
+- NON-OVERLAPPING clips covering distinct moments. NEVER select overlapping or duplicate time ranges — each clip must be from a DIFFERENT moment.
 
 VIDEO_DURATION_SECONDS: {video_duration}
 
@@ -571,6 +581,101 @@ def detect_scenes(video_path, threshold=27.0):
     fps = video.frame_rate
     return scene_list, fps
 
+def is_junk_scene(video_path, start_sec, end_sec, video_duration):
+    """Detect if a scene is a junk scene (intro, outro, transition, end screen, text-only).
+
+    Uses visual analysis: checks if frames are near-black/white, low complexity,
+    or mostly static text screens. Also filters scenes in the last 5% of video
+    that are likely end screens.
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return False
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    duration = end_sec - start_sec
+
+    # Sample 3 frames from the scene
+    sample_times = [
+        start_sec + duration * 0.25,
+        start_sec + duration * 0.50,
+        start_sec + duration * 0.75,
+    ]
+
+    dark_count = 0
+    low_complexity_count = 0
+
+    for t in sample_times:
+        frame_num = int(t * fps)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        mean_val = gray.mean()
+        std_val = gray.std()
+
+        # Near-black or near-white frame (end screens, transitions)
+        if mean_val < 25 or mean_val > 240:
+            dark_count += 1
+
+        # Low visual complexity (text-only screens, solid colors, simple graphics)
+        # Real content (people, objects, outdoor) has high std deviation
+        if std_val < 35:
+            low_complexity_count += 1
+
+    cap.release()
+
+    # If majority of frames are dark/white → junk
+    if dark_count >= 2:
+        return True
+
+    # If majority of frames are low complexity → likely text screen or transition
+    if low_complexity_count >= 2:
+        return True
+
+    # Scenes in the last 5% of video that are short (< 8s) are likely end screens
+    if start_sec > video_duration * 0.95 and duration < 8.0:
+        return True
+
+    # Scenes in the first 3% of video that are short (< 5s) are likely intros
+    if end_sec < video_duration * 0.03 and duration < 5.0:
+        return True
+
+    return False
+
+
+def filter_junk_scenes(video_path, scene_bounds, video_duration):
+    """Filter out junk scenes (intros, outros, transitions, end screens) from scene list.
+    Returns filtered list and prints what was removed."""
+    filtered = []
+    removed = 0
+    for i, (start, end) in enumerate(scene_bounds):
+        if is_junk_scene(video_path, start, end, video_duration):
+            print(f"   🗑️  Filtering junk scene {i+1}: {start:.1f}s–{end:.1f}s ({end-start:.1f}s)")
+            removed += 1
+        else:
+            filtered.append((start, end))
+    if removed:
+        print(f"   🧹 Removed {removed} junk scene(s), {len(filtered)} valid scenes remaining")
+    return filtered
+
+
+def fit_fontsize(text, max_fontsize, max_width, char_width_ratio=0.6):
+    """Calculate font size that fits text within max_width.
+    char_width_ratio: approximate ratio of char width to font size for monospace-like fonts."""
+    text_len = len(text)
+    if text_len == 0:
+        return max_fontsize
+    # Estimate: each char is roughly char_width_ratio * fontsize pixels wide
+    estimated_width = text_len * char_width_ratio * max_fontsize
+    if estimated_width <= max_width:
+        return max_fontsize
+    # Scale down proportionally
+    return max(int(max_fontsize * max_width / estimated_width), int(max_fontsize * 0.5))
+
+
 def get_video_resolution(video_path):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -809,7 +914,7 @@ def process_video_to_vertical(input_video, final_output_video, force_general=Fal
         'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
         '-s', f'{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}', '-pix_fmt', 'bgr24',
         '-r', str(fps), '-i', '-', '-c:v', 'libx264',
-        '-preset', 'medium', '-crf', '18', '-pix_fmt', 'yuv420p', '-an', temp_video_output
+        '-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p', '-an', temp_video_output
     ]
 
     ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -1195,21 +1300,85 @@ def get_ranking_clips(transcript_result, video_duration, num_clips=6, scene_boun
                 if scene_id is not None:
                     idx = max(0, min(scene_id - 1, len(scene_boundaries) - 1))
                     scene_start, scene_end = scene_boundaries[idx]
-                    # Use Gemini's trim points if provided and valid, else use full scene
-                    trim_start = clip.get('trim_start')
-                    trim_end = clip.get('trim_end')
-                    if (trim_start is not None and trim_end is not None
-                            and trim_start >= scene_start - 0.5 and trim_end <= scene_end + 0.5
-                            and trim_end > trim_start):
-                        clip['start'] = max(trim_start, 0)
-                        clip['end'] = min(trim_end, video_duration)
-                        print(f"   ✅ Rank {clip.get('rank')}: Scene {idx+1}, trimmed {clip['start']:.1f}s–{clip['end']:.1f}s")
-                    else:
-                        clip['start'] = scene_start
-                        clip['end'] = scene_end
-                        print(f"   ✅ Rank {clip.get('rank')}: Scene {idx+1} = {clip['start']:.1f}s–{clip['end']:.1f}s (full scene)")
+                    # ALWAYS use full scene — Gemini's trim points cut too aggressively
+                    clip['start'] = scene_start
+                    clip['end'] = scene_end
+                    print(f"   ✅ Rank {clip.get('rank')}: Scene {idx+1} = {clip['start']:.1f}s–{clip['end']:.1f}s (full scene)")
                 else:
                     print(f"   ⚠️ Rank {clip.get('rank')}: missing scene_id, using raw start/end")
+
+        # === DEDUPLICATE CLIPS ===
+        if 'shorts' in result_json:
+            original_count = len(result_json['shorts'])
+            deduped = []
+            seen_scene_ids = set()
+            used_ranges = []  # list of (start, end) tuples
+
+            for clip in result_json['shorts']:
+                # Check duplicate scene_id
+                scene_id = clip.get('scene_id')
+                if scene_id is not None and scene_id in seen_scene_ids:
+                    print(f"   🔄 Removing duplicate: Rank {clip.get('rank')} uses same scene {scene_id}")
+                    continue
+
+                # Check overlapping time ranges (>50% overlap = duplicate)
+                clip_start = clip.get('start', 0)
+                clip_end = clip.get('end', 0)
+                clip_dur = clip_end - clip_start
+                is_overlap = False
+                if clip_dur > 0:
+                    for used_s, used_e in used_ranges:
+                        overlap_start = max(clip_start, used_s)
+                        overlap_end = min(clip_end, used_e)
+                        overlap = max(0, overlap_end - overlap_start)
+                        if overlap > clip_dur * 0.5:
+                            print(f"   🔄 Removing overlapping clip: Rank {clip.get('rank')} ({clip_start:.1f}–{clip_end:.1f}s)")
+                            is_overlap = True
+                            break
+                if is_overlap:
+                    continue
+
+                if scene_id is not None:
+                    seen_scene_ids.add(scene_id)
+                used_ranges.append((clip_start, clip_end))
+                deduped.append(clip)
+
+            if len(deduped) < original_count:
+                print(f"   🧹 Deduplicated: {original_count} → {len(deduped)} clips")
+            result_json['shorts'] = deduped
+
+        # === POST-GEMINI JUNK FILTER (programmatic validation) ===
+        if 'shorts' in result_json and video_path and os.path.exists(video_path):
+            validated = []
+            for clip in result_json['shorts']:
+                clip_start = clip.get('start', 0)
+                clip_end = clip.get('end', 0)
+                if is_junk_scene(video_path, clip_start, clip_end, video_duration):
+                    print(f"   🗑️ Post-filter: rejecting junk clip Rank {clip.get('rank', '?')} ({clip_start:.1f}s–{clip_end:.1f}s)")
+                else:
+                    validated.append(clip)
+            if len(validated) < len(result_json['shorts']):
+                print(f"   🧹 Post-filter: {len(result_json['shorts'])} → {len(validated)} clips")
+                # Re-assign ranks
+                for i, clip in enumerate(validated):
+                    clip['rank'] = len(validated) - i
+            result_json['shorts'] = validated
+
+        # === REFINE TITLES WITH FRAME EXTRACTION (second pass) ===
+        if 'shorts' in result_json and video_path and os.path.exists(video_path):
+            result_json['shorts'] = refine_ranking_titles_with_frames(
+                video_path, result_json['shorts'], api_key
+            )
+
+        # === REJECT BAD TITLES (text/screen/watching indicators) ===
+        JUNK_TITLE_WORDS = {'SCREEN', 'TEXT', 'DISPLAYS', 'WATCHING', 'SUBSCRIBE', 'THANKS', 'CREDITS', 'INTRO', 'OUTRO', 'LOGO'}
+        if 'shorts' in result_json:
+            for clip in result_json['shorts']:
+                title = clip.get('ranking_title', '')
+                title_words = set(title.upper().split())
+                if title_words & JUNK_TITLE_WORDS:
+                    print(f"   ⚠️ Bad title detected: '{title}' → replacing with 'EPIC FAIL MOMENT'")
+                    clip['ranking_title'] = 'EPIC FAIL MOMENT'
 
         # Ensure clips are ordered rank N → 1 (ascending rank = descending position)
         if 'shorts' in result_json:
@@ -1227,6 +1396,118 @@ def get_ranking_clips(transcript_result, video_duration, num_clips=6, scene_boun
                 print(f"   🗑️ Cleaned up uploaded video from Gemini")
             except Exception:
                 pass
+
+
+def refine_ranking_titles_with_frames(video_path, clips, api_key):
+    """Second pass: extract mid-point frames from each clip and ask Gemini to describe the visual action.
+    This fixes the problem of Gemini assigning wrong titles when watching the full video."""
+    print(f"   🎯 Refining {len(clips)} ranking titles with frame extraction...")
+
+    client = genai.Client(api_key=api_key)
+    model_name = 'gemini-2.5-flash'
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print("   ⚠️ Cannot open video for frame extraction, keeping original titles")
+        return clips
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frames_data = []
+    temp_frame_paths = []
+
+    for i, clip in enumerate(clips):
+        clip_start = clip.get('start', 0)
+        clip_end = clip.get('end', 0)
+        clip_dur = clip_end - clip_start
+        # Extract 3 frames (25%, 50%, 75%) for better context
+        sample_times = [
+            clip_start + clip_dur * 0.25,
+            clip_start + clip_dur * 0.50,
+            clip_start + clip_dur * 0.75,
+        ]
+        clip_frame_paths = []
+        for j, t in enumerate(sample_times):
+            frame_num = int(t * fps)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+            ret, frame = cap.read()
+            if ret:
+                temp_path = f"/tmp/ranking_frame_{i}_{j}.jpg"
+                cv2.imwrite(temp_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                clip_frame_paths.append(temp_path)
+                temp_frame_paths.append(temp_path)
+        if clip_frame_paths:
+            frames_data.append({
+                'rank': clip.get('rank', i + 1),
+                'paths': clip_frame_paths,
+                'time': f"{clip_start:.1f}s–{clip_end:.1f}s"
+            })
+        else:
+            frames_data.append(None)
+
+    cap.release()
+
+    valid_frames = [f for f in frames_data if f is not None]
+    if not valid_frames:
+        print("   ⚠️ No frames extracted, keeping original titles")
+        return clips
+
+    # Build prompt with all frames (3 per clip for better context)
+    prompt_lines = [
+        "Below you will see GROUPS of 3 images. Each group of 3 images shows frames from the SAME video clip (beginning, middle, end) in a fail compilation.",
+        "For EACH GROUP, describe the PHYSICAL ACTION happening in that clip in 3-4 words, ALL CAPS, no emoji.",
+        "Look at ALL 3 frames together to understand the motion/action — what is moving, falling, crashing, etc.",
+        "GOOD examples: 'FALLS OFF SKATEBOARD', 'CAR HITS WALL', 'DOG STEALS FOOD', 'SLIPS ON ICE'",
+        "BAD examples: anything generic like 'FUNNY MOMENT', 'EPIC FAIL', or text/audio based descriptions.",
+        "",
+        f"Return exactly {len(valid_frames)} titles (one per clip group).",
+        "RETURN ONLY VALID JSON (no markdown):",
+        '{"titles": ["TITLE FOR CLIP 1", "TITLE FOR CLIP 2", ...]}'
+    ]
+    prompt = "\n".join(prompt_lines)
+
+    try:
+        from PIL import Image
+        contents = []
+        for f in valid_frames:
+            contents.append(f"--- Clip for Rank {f['rank']} ({f['time']}) ---")
+            for path in f['paths']:
+                img = Image.open(path)
+                contents.append(img)
+        contents.append(prompt)
+
+        response = client.models.generate_content(model=model_name, contents=contents)
+        text = response.text
+        if text.startswith("```json"):
+            text = text[7:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+
+        result = json.loads(text)
+        new_titles = result.get('titles', [])
+
+        if len(new_titles) == len(valid_frames):
+            valid_idx = 0
+            for i, clip in enumerate(clips):
+                if frames_data[i] is not None:
+                    old_title = clip.get('ranking_title', '')
+                    new_title = new_titles[valid_idx].strip().upper()
+                    if new_title and len(new_title.split()) <= 6:
+                        clip['ranking_title'] = new_title
+                        if old_title != new_title:
+                            print(f"   ✅ Rank {clip.get('rank')}: '{old_title}' → '{new_title}'")
+                    valid_idx += 1
+        else:
+            print(f"   ⚠️ Title count mismatch ({len(new_titles)} vs {len(valid_frames)}), keeping originals")
+
+    except Exception as e:
+        print(f"   ⚠️ Title refinement failed: {e}, keeping original titles")
+    finally:
+        for p in temp_frame_paths:
+            if os.path.exists(p):
+                os.remove(p)
+
+    return clips
 
 
 def get_short_metadata(transcript_result, video_duration):
@@ -1461,7 +1742,10 @@ if __name__ == '__main__':
             if scene_bounds:
                 # Filter out short scenes (< 4s) — too short for a good ranking clip
                 scene_bounds = [(s, e) for s, e in scene_bounds if e - s >= 4.0]
-                print(f"   ✅ Found {len(scene_bounds)} visual scenes (after splitting long ones)")
+                # Filter out junk scenes (intros, outros, transitions, end screens)
+                print(f"   🔍 Filtering junk scenes (intros, outros, transitions, end screens)...")
+                scene_bounds = filter_junk_scenes(input_video, scene_bounds, duration)
+                print(f"   ✅ {len(scene_bounds)} valid scenes remaining")
                 for i, (s, e) in enumerate(scene_bounds):
                     print(f"      Scene {i+1}: {s:.1f}s – {e:.1f}s ({e-s:.1f}s)")
             else:
@@ -1528,6 +1812,20 @@ if __name__ == '__main__':
                         clip['end'] = new_start + RANKING_MAX_CLIP_DURATION
                         print(f"   ✂️ Rank {clip.get('rank')}: trimmed to {RANKING_MAX_CLIP_DURATION}s ({clip['start']:.1f}–{clip['end']:.1f}s)")
 
+                # Validate and sanitize ranking titles
+                for clip in clips_data['shorts']:
+                    title = clip.get('ranking_title', '')
+                    # Strip emojis and excessive whitespace
+                    title = strip_emojis(title).strip()
+                    # Reject titles that are too long (>6 words), empty, or look like transcript noise
+                    words_in_title = title.split()
+                    if not title or len(words_in_title) > 6 or len(title) > 50:
+                        rank = clip.get('rank', '?')
+                        clip['ranking_title'] = f"EPIC FAIL #{rank}"
+                        print(f"   ⚠️ Rank {rank}: bad title '{title}' → fallback '{clip['ranking_title']}'")
+                    else:
+                        clip['ranking_title'] = title.upper()
+
                 # Sort all clips by rank descending
                 all_shorts = clips_data['shorts']
                 all_shorts.sort(key=lambda x: x.get('rank', 999), reverse=True)
@@ -1541,11 +1839,67 @@ if __name__ == '__main__':
 
                 print(f"\n🎬 === Generating {len(batches)} Ranking Short(s) from {len(all_shorts)} clips ===")
 
+                # --- PARALLEL CLIP PROCESSING ---
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+
+                # Collect ALL clips across all batches for parallel processing
+                all_clip_jobs = []  # (batch_idx, local_i, clip, seg_temp, seg_vertical)
                 for batch_idx, batch in enumerate(batches):
-                    # Re-number ranks within this batch (N → 1)
                     for i, clip in enumerate(batch):
                         clip['_local_rank'] = len(batch) - i
+                    for local_i, clip in enumerate(batch):
+                        seg_filename = f"temp_seg_{batch_idx}_{local_i}.mp4"
+                        seg_temp = os.path.join(output_dir, f"temp_raw_{seg_filename}")
+                        seg_vertical = os.path.join(output_dir, f"temp_vert_{seg_filename}")
+                        all_clip_jobs.append((batch_idx, local_i, clip, seg_temp, seg_vertical))
 
+                def _process_one_clip(job):
+                    """Extract + vertical reframe a single clip. Runs in a thread."""
+                    b_idx, l_i, clip, seg_temp, seg_vertical = job
+                    local_rank = clip['_local_rank']
+                    start, end = clip['start'], clip['end']
+                    clip_dur = end - start
+                    ranking_title = clip.get('ranking_title', f'TOP {local_rank}')
+                    print(f"  ⏳ Processing TOP {local_rank} (batch {b_idx+1}): {start:.1f}s–{end:.1f}s ({clip_dur:.1f}s) — {ranking_title}")
+
+                    cut_cmd = [
+                        'ffmpeg', '-y', '-ss', str(start),
+                        '-i', input_video,
+                        '-t', str(clip_dur),
+                        '-c:v', 'libx264', '-crf', '18', '-preset', 'fast', '-r', '30',
+                        '-c:a', 'aac', seg_temp
+                    ]
+                    subprocess.run(cut_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+                    success = process_video_to_vertical(seg_temp, seg_vertical, force_general=True)
+                    if os.path.exists(seg_temp):
+                        os.remove(seg_temp)
+                    if not success:
+                        print(f"  ⚠️ Reframe failed for batch {b_idx+1} clip {l_i+1}, skipping")
+                        return None
+
+                    try:
+                        dur_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', seg_vertical]
+                        seg_dur = float(subprocess.check_output(dur_cmd).decode().strip())
+                    except Exception:
+                        seg_dur = clip_dur
+
+                    print(f"  ✅ TOP {local_rank} ready ({seg_dur:.1f}s)")
+                    return (b_idx, l_i, local_rank, ranking_title, seg_vertical, seg_dur)
+
+                PARALLEL_WORKERS = min(3, len(all_clip_jobs))
+                print(f"   🚀 Processing {len(all_clip_jobs)} clips with {PARALLEL_WORKERS} parallel workers...")
+                clip_results = {}  # (batch_idx, local_i) → result
+                with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
+                    futures = {executor.submit(_process_one_clip, job): job for job in all_clip_jobs}
+                    for future in as_completed(futures):
+                        result = future.result()
+                        if result:
+                            b_idx, l_i, _, _, _, _ = result
+                            clip_results[(b_idx, l_i)] = result
+
+                # Reassemble results per batch (in original order)
+                for batch_idx, batch in enumerate(batches):
                     print(f"\n🎬 --- Ranking Short #{batch_idx + 1}: TOP {len(batch)} → TOP 1 ---")
 
                     segment_paths = []
@@ -1553,44 +1907,14 @@ if __name__ == '__main__':
                     segment_ranks = []
                     segment_titles = []
 
-                    for local_i, clip in enumerate(batch):
-                        local_rank = clip['_local_rank']
-                        start = clip['start']
-                        end = clip['end']
-                        clip_dur = end - start
-                        ranking_title = clip.get('ranking_title', f'TOP {local_rank}')
-                        print(f"  Extract TOP {local_rank}: {start:.1f}s - {end:.1f}s ({clip_dur:.1f}s) — {ranking_title}")
-
-                        seg_filename = f"temp_seg_{batch_idx}_{local_i}.mp4"
-                        seg_temp = os.path.join(output_dir, f"temp_raw_{seg_filename}")
-                        seg_vertical = os.path.join(output_dir, f"temp_vert_{seg_filename}")
-
-                        cut_cmd = [
-                            'ffmpeg', '-y', '-ss', str(start), '-to', str(end),
-                            '-i', input_video,
-                            '-c:v', 'libx264', '-crf', '18', '-preset', 'fast', '-r', '30',
-                            '-c:a', 'aac', seg_temp
-                        ]
-                        subprocess.run(cut_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-
-                        success = process_video_to_vertical(seg_temp, seg_vertical, force_general=True)
-                        if os.path.exists(seg_temp):
-                            os.remove(seg_temp)
-                        if not success:
-                            print(f"  ⚠️ Reframe failed for extract {local_i+1}, skipping")
-                            continue
-
-                        try:
-                            dur_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', seg_vertical]
-                            seg_dur = float(subprocess.check_output(dur_cmd).decode().strip())
-                        except Exception:
-                            seg_dur = clip_dur
-
-                        segment_paths.append(seg_vertical)
-                        segment_durations.append(seg_dur)
-                        segment_ranks.append(local_rank)
-                        segment_titles.append(ranking_title)
-                        print(f"  ✅ TOP {local_rank} ready ({seg_dur:.1f}s)")
+                    for local_i in range(len(batch)):
+                        r = clip_results.get((batch_idx, local_i))
+                        if r:
+                            _, _, local_rank, ranking_title, seg_vertical, seg_dur = r
+                            segment_paths.append(seg_vertical)
+                            segment_durations.append(seg_dur)
+                            segment_ranks.append(local_rank)
+                            segment_titles.append(ranking_title)
 
                     if len(segment_paths) < 2:
                         print(f"  ❌ Not enough segments for Ranking #{batch_idx+1}, skipping")
@@ -1645,19 +1969,29 @@ if __name__ == '__main__':
                         vw, vh = 1080, 1920
 
                     font_spec = "font=Liberation Sans Bold"
-                    active_fontsize = int(vw * 0.046)
-                    past_fontsize = int(vw * 0.036)
+                    max_active_fontsize = int(vw * 0.046)
+                    max_past_fontsize = int(vw * 0.036)
                     line_height = int(vh * 0.035)
                     base_y = int(vh * 0.55)
                     margin_x = int(vw * 0.05)
+                    max_text_width = vw - 2 * margin_x
 
                     filter_parts = []
                     total_segments = len(segment_ranks)
+
+                    # Read title texts for font size calculation
+                    title_texts = []
+                    for tf in title_files:
+                        with open(tf, 'r', encoding='utf-8') as fh:
+                            title_texts.append(fh.read().strip())
 
                     for seg_idx in range(total_segments):
                         seg_start, seg_end = seg_time_ranges[seg_idx]
                         txt_esc = title_files[seg_idx].replace(":", "\\:").replace("'", "'\\''")
                         line_y = base_y + seg_idx * line_height
+                        text = title_texts[seg_idx] if seg_idx < len(title_texts) else ''
+                        active_fontsize = fit_fontsize(text, max_active_fontsize, max_text_width)
+                        past_fontsize = fit_fontsize(text, max_past_fontsize, max_text_width)
 
                         # Active state
                         filter_parts.append(
@@ -1686,7 +2020,7 @@ if __name__ == '__main__':
                     overlay_cmd = [
                         'ffmpeg', '-y', '-i', concat_raw,
                         '-vf', filter_chain,
-                        '-c:a', 'copy', '-c:v', 'libx264', '-preset', 'medium', '-crf', '18', '-pix_fmt', 'yuv420p',
+                        '-c:a', 'copy', '-c:v', 'libx264', '-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p',
                         short_output
                     ]
 
@@ -1717,8 +2051,9 @@ if __name__ == '__main__':
 
                     cut_command = [
                         'ffmpeg', '-y',
-                        '-ss', str(start), '-to', str(end),
+                        '-ss', str(start),
                         '-i', input_video,
+                        '-t', str(end - start),
                         '-c:v', 'libx264', '-crf', '18', '-preset', 'fast', '-c:a', 'aac',
                         clip_temp_path
                     ]

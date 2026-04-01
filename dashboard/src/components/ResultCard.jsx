@@ -9,7 +9,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
     const [showModal, setShowModal] = useState(false);
     const [showSubtitleModal, setShowSubtitleModal] = useState(false);
     const videoRef = React.useRef(null);
-    const [currentVideoUrl, setCurrentVideoUrl] = useState(getApiUrl(clip.video_url));
+    const [currentVideoUrl, setCurrentVideoUrl] = useState(getApiUrl(clip.video_url) + '#t=0.1');
 
     const [platforms, setPlatforms] = useState({
         tiktok: true,
@@ -79,7 +79,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
 
             const data = await res.json();
             if (data.new_video_url) {
-                setCurrentVideoUrl(getApiUrl(data.new_video_url));
+                setCurrentVideoUrl(getApiUrl(data.new_video_url) + '#t=0.1');
                 // Reload video
                 if (videoRef.current) {
                     videoRef.current.load();
@@ -123,7 +123,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
 
             const data = await res.json();
             if (data.new_video_url) {
-                setCurrentVideoUrl(getApiUrl(data.new_video_url));
+                setCurrentVideoUrl(getApiUrl(data.new_video_url) + '#t=0.1');
                 if (videoRef.current) {
                     videoRef.current.load();
                 }
@@ -167,7 +167,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
 
             const data = await res.json();
             if (data.new_video_url) {
-                setCurrentVideoUrl(getApiUrl(data.new_video_url));
+                setCurrentVideoUrl(getApiUrl(data.new_video_url) + '#t=0.1');
                 if (videoRef.current) {
                     videoRef.current.load();
                 }
@@ -229,7 +229,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
             const data = await res.json();
             console.log('[Translate] Success response:', data);
             if (data.new_video_url) {
-                setCurrentVideoUrl(getApiUrl(data.new_video_url));
+                setCurrentVideoUrl(getApiUrl(data.new_video_url) + '#t=0.1');
                 if (videoRef.current) {
                     videoRef.current.load();
                 }
@@ -320,6 +320,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                     ref={videoRef}
                     src={currentVideoUrl}
                     controls
+                    preload="metadata"
                     className="w-full h-full object-cover"
                     playsInline
                     onPlay={() => {
@@ -398,8 +399,8 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                                 </div>
                                 <button
                                     onClick={() => {
-                                        const hashtags = clip.hashtags_tiktok || clip.hashtags_instagram || '';
-                                        navigator.clipboard.writeText(hashtags);
+                                        const raw = clip.hashtags_tiktok || clip.hashtags_instagram || '';
+                                        navigator.clipboard.writeText(Array.isArray(raw) ? raw.join(' ') : String(raw));
                                     }}
                                     className="text-[10px] text-cyan-400 hover:text-cyan-300 flex items-center gap-1 transition-colors"
                                     title="Copier les hashtags"
@@ -409,7 +410,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                                 </button>
                             </div>
                             <div className="flex flex-wrap gap-1.5">
-                                {(clip.hashtags_tiktok || clip.hashtags_instagram || '').split(/\s+/).filter(h => h.startsWith('#')).map((tag, i) => (
+                                {(() => { const raw = clip.hashtags_tiktok || clip.hashtags_instagram || ''; return Array.isArray(raw) ? raw : String(raw).split(/\s+/); })().filter(h => typeof h === 'string' && h.startsWith('#')).map((tag, i) => (
                                     <span
                                         key={i}
                                         onClick={() => navigator.clipboard.writeText(tag)}

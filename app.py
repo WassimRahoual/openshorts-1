@@ -17,6 +17,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
+from reddit import fetch_reddit_feed, download_reddit_video, DEFAULT_SUBREDDITS
+from reddit_ranking import compile_ranking
 
 load_dotenv()
 
@@ -2213,3 +2215,328 @@ async def saasshorts_voices(
         ],
         "source": "defaults",
     }
+
+
+# ── Cartoon Stories Endpoints ─────────────────────────────────────────
+
+from cartoonstories import (
+    generate_story,
+    generate_cartoon_video,
+    STYLE_PRESETS as CARTOON_STYLES,
+    GENRE_PRESETS as CARTOON_GENRES,
+)
+
+cartoon_jobs: Dict[str, Dict] = {}
+
+
+class CartoonStoryRequest(BaseModel):
+    topic: str
+    genre: str = "fairy_tale"
+    style: str = "pixar_3d"
+    language: str = "fr"
+    num_scenes: int = 6
+
+
+class CartoonGenerateRequest(BaseModel):
+    story: dict
+    voice_id: Optional[str] = None
+    video_mode: str = "lowcost"
+    retry_job_id: Optional[str] = None
+
+
+@app.get("/api/cartoon/options")
+async def cartoon_options():
+    """Return available styles and genres for cartoon stories."""
+    return {
+        "styles": {k: v.rstrip(",") for k, v in CARTOON_STYLES.items()},
+        "genres": CARTOON_GENRES,
+    }
+
+
+@app.post("/api/cartoon/story")
+async def cartoon_generate_story(
+    req: CartoonStoryRequest,
+    x_gemini_key: Optional[str] = Header(None, alias="X-Gemini-Key"),
+):
+    """Generate a cartoon story script using Gemini."""
+    gemini_key = x_gemini_key
+    if not gemini_key:
+        raise HTTPException(status_code=400, detail="Missing Gemini API Key")
+
+    loop = asyncio.get_running_loop()
+    story = await loop.run_in_executor(
+        None,
+        lambda: generate_story(
+            topic=req.topic,
+            gemini_key=gemini_key,
+            genre=req.genre,
+            style=req.style,
+            language=req.language,
+            num_scenes=req.num_scenes,
+        ),
+    )
+    return {"story": story}
+
+
+@app.post("/api/cartoon/generate")
+async def cartoon_generate_video(
+    req: CartoonGenerateRequest,
+    x_fal_key: Optional[str] = Header(None, alias="X-Fal-Key"),
+    x_elevenlabs_key: Optional[str] = Header(None, alias="X-ElevenLabs-Key"),
+):
+    """Generate a cartoon story video. Returns a job_id for polling."""
+    fal_key = x_fal_key
+    elevenlabs_key = x_elevenlabs_key
+
+    if not fal_key:
+        raise HTTPException(status_code=400, detail="Missing fal.ai API Key (X-Fal-Key header)")
+    if not elevenlabs_key:
+        raise HTTPException(status_code=400, detail="Missing ElevenLabs API Key (X-ElevenLabs-Key header)")
+
+    # Support retry
+    reused = False
+    if req.retry_job_id:
+        old_dir = os.path.join(OUTPUT_DIR, f"cartoon_{req.retry_job_id}")
+        if req.retry_job_id in cartoon_jobs:
+            old_dir = cartoon_jobs[req.retry_job_id]["output_dir"]
+        if os.path.isdir(old_dir):
+            job_id = req.retry_job_id
+            job_output_dir = old_dir
+            reused = True
+            for f in os.listdir(old_dir):
+                fp = os.path.join(old_dir, f)
+                if f.endswith("_final.mp4") and os.path.getsize(fp) == 0:
+                    os.remove(fp)
+            cartoon_jobs[job_id] = {
+                "status": "processing",
+                "logs": [f"Retrying job {job_id[:8]}... reusing cached assets."],
+                "result": None,
+                "output_dir": job_output_dir,
+            }
+
+    if not reused:
+        job_id = str(uuid.uuid4())
+        job_output_dir = os.path.join(OUTPUT_DIR, f"cartoon_{job_id}")
+        os.makedirs(job_output_dir, exist_ok=True)
+        cartoon_jobs[job_id] = {
+            "status": "processing",
+            "logs": ["Cartoon story generation started."],
+            "result": None,
+            "output_dir": job_output_dir,
+        }
+
+    config = {
+        "fal_key": fal_key,
+        "elevenlabs_key": elevenlabs_key,
+        "voice_id": req.voice_id or "21m00Tcm4TlvDq8ikWAM",
+        "video_mode": req.video_mode,
+    }
+
+    async def run_generation():
+        await concurrency_semaphore.acquire()
+        try:
+            loop = asyncio.get_running_loop()
+
+            def log_msg(msg):
+                print(f"[Cartoon Job {job_id[:8]}] {msg}")
+                if job_id in cartoon_jobs:
+                    cartoon_jobs[job_id]["logs"].append(msg)
+
+            def run():
+                return generate_cartoon_video(req.story, config, job_output_dir, log_msg)
+
+            result = await loop.run_in_executor(None, run)
+
+            if job_id in cartoon_jobs:
+                video_filename = result["video_filename"]
+                cartoon_jobs[job_id]["status"] = "completed"
+                cartoon_jobs[job_id]["result"] = {
+                    "video_url": f"/videos/cartoon_{job_id}/{video_filename}",
+                    "video_filename": video_filename,
+                    "duration": result.get("duration", 0),
+                    "cost_estimate": result.get("cost_estimate", {}),
+                    "story": req.story,
+                }
+                cartoon_jobs[job_id]["logs"].append("Video generation completed!")
+
+        except Exception as e:
+            print(f"[Cartoon] Job {job_id} failed: {e}")
+            if job_id in cartoon_jobs:
+                cartoon_jobs[job_id]["status"] = "failed"
+                cartoon_jobs[job_id]["logs"].append(f"Error: {str(e)}")
+        finally:
+            concurrency_semaphore.release()
+
+    asyncio.create_task(run_generation())
+    return {"job_id": job_id, "status": "processing"}
+
+
+@app.get("/api/cartoon/status/{job_id}")
+async def cartoon_status(job_id: str):
+    """Poll cartoon story job status."""
+    if job_id not in cartoon_jobs:
+        raise HTTPException(status_code=404, detail="Cartoon job not found")
+    job = cartoon_jobs[job_id]
+    return {
+        "status": job["status"],
+        "logs": job["logs"],
+        "result": job.get("result"),
+    }
+
+
+# ── Reddit Feed Endpoints ─────────────────────────────────────────────
+
+@app.get("/api/reddit/subreddits")
+async def reddit_subreddits():
+    """List available subreddits for fail video browsing."""
+    return {"subreddits": DEFAULT_SUBREDDITS}
+
+
+@app.get("/api/reddit/feed")
+async def reddit_feed(
+    subreddit: str = "fail",
+    sort: str = "hot",
+    time_filter: str = "week",
+    after: Optional[str] = None,
+    limit: int = 25,
+):
+    """Fetch video posts from a subreddit."""
+    try:
+        result = await fetch_reddit_feed(
+            subreddit=subreddit,
+            sort=sort,
+            time_filter=time_filter,
+            after=after,
+            limit=limit,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Reddit API error: {str(e)}")
+
+
+@app.post("/api/reddit/process")
+async def reddit_process(
+    request: Request,
+):
+    """
+    Download multiple Reddit videos and compile them into a ranking short.
+
+    Body: {
+        "clips": [
+            {"video_url": "...", "reddit_post_url": "...", "title": "..."},
+            ...
+        ]
+    }
+    Clips are ordered TOP N (first) → TOP 1 (last = best).
+    """
+    api_key = request.headers.get("X-Gemini-Key")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
+
+    body = await request.json()
+    clips = body.get("clips", [])
+
+    if len(clips) < 2:
+        raise HTTPException(status_code=400, detail="Need at least 2 clips for a ranking")
+    if len(clips) > 10:
+        raise HTTPException(status_code=400, detail="Maximum 10 clips per ranking")
+
+    job_id = str(uuid.uuid4())
+    job_output_dir = os.path.join(OUTPUT_DIR, job_id)
+    os.makedirs(job_output_dir, exist_ok=True)
+    download_dir = os.path.join(UPLOAD_DIR, f"reddit_{job_id}")
+
+    # Create job immediately so frontend can poll
+    jobs[job_id] = {
+        "status": "processing",
+        "logs": [f"Job {job_id} started — Reddit Ranking ({len(clips)} clips)."],
+        "cmd": None,
+        "env": None,
+        "output_dir": job_output_dir,
+        "mode": "ranking",
+    }
+
+    async def _run_reddit_ranking():
+        loop = asyncio.get_event_loop()
+        try:
+            # Step 1: Download all clips
+            downloaded_paths = []
+            titles = []
+            for i, clip in enumerate(clips):
+                video_url = clip.get("video_url", "")
+                post_url = clip.get("reddit_post_url", "")
+                title = clip.get("title", f"Fail #{len(clips) - i}")
+
+                jobs[job_id]["logs"].append(f"⬇️  Downloading clip {i+1}/{len(clips)}: {title[:60]}...")
+                clip_dir = os.path.join(download_dir, f"clip_{i}")
+                try:
+                    path = await loop.run_in_executor(
+                        None,
+                        download_reddit_video,
+                        video_url or post_url,
+                        post_url or video_url,
+                        clip_dir,
+                    )
+                    downloaded_paths.append(path)
+                    titles.append(title)
+                    jobs[job_id]["logs"].append(f"   ✅ Clip {i+1} downloaded")
+                except Exception as e:
+                    jobs[job_id]["logs"].append(f"   ⚠️ Clip {i+1} download failed: {str(e)[:200]}")
+
+            if len(downloaded_paths) < 2:
+                jobs[job_id]["status"] = "failed"
+                jobs[job_id]["logs"].append("❌ Not enough clips downloaded (need at least 2)")
+                return
+
+            # Step 2: Compile ranking (blocking — runs FFmpeg + reframing)
+            jobs[job_id]["logs"].append(f"\n🏆 Compiling ranking from {len(downloaded_paths)} clips...")
+            result_path = await loop.run_in_executor(
+                None,
+                compile_ranking,
+                downloaded_paths,
+                titles,
+                job_output_dir,
+                "reddit_ranking",
+            )
+
+            if not result_path:
+                jobs[job_id]["status"] = "failed"
+                jobs[job_id]["logs"].append("❌ Ranking compilation failed")
+                return
+
+            # Step 3: Build result (same format as main pipeline)
+            meta_path = os.path.join(job_output_dir, "reddit_ranking_metadata.json")
+            metadata = {}
+            if os.path.exists(meta_path):
+                with open(meta_path) as f:
+                    metadata = json.load(f)
+
+            video_filename = os.path.basename(result_path)
+            result_clips = []
+            for short in metadata.get("shorts", [{}]):
+                result_clips.append({
+                    "video_url": f"/videos/{job_id}/{video_filename}",
+                    "video_title_for_youtube_short": short.get("video_title_for_youtube_short", ""),
+                    "video_description_for_tiktok": short.get("video_description_for_tiktok", ""),
+                    "video_description_for_instagram": short.get("video_description_for_instagram", ""),
+                    "viral_hook_text": short.get("viral_hook_text", ""),
+                    "hashtags_tiktok": short.get("hashtags_tiktok", ""),
+                    "hashtags_instagram": short.get("hashtags_instagram", ""),
+                })
+
+            jobs[job_id]["result"] = {"clips": result_clips}
+            jobs[job_id]["status"] = "completed"
+            jobs[job_id]["logs"].append(f"🏆 Ranking ready! {len(downloaded_paths)} clips compiled.")
+
+        except Exception as e:
+            jobs[job_id]["status"] = "failed"
+            jobs[job_id]["logs"].append(f"❌ Error: {str(e)}")
+        finally:
+            # Cleanup downloads
+            shutil.rmtree(download_dir, ignore_errors=True)
+
+    asyncio.create_task(_run_reddit_ranking())
+
+    return {"job_id": job_id, "status": "processing"}
