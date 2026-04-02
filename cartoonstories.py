@@ -265,7 +265,7 @@ def animate_scene(
                 "prompt": prompt,
             },
             fal_key,
-            timeout=300,
+            timeout=600,
         )
 
     # Extract video URL
@@ -295,16 +295,41 @@ def animate_all_scenes(
     slug: str,
     mode: str = "lowcost",
     log: Callable = print,
+    max_retries: int = 2,
 ) -> List[str]:
-    """Animate all scene images into video clips. Sequential to avoid API limits."""
-    log(f"[3/6] Animating {len(scenes)} scenes ({'Kling v2' if mode == 'premium' else 'Hailuo 2.3'})...")
+    """Animate all scene images into video clips. Sequential with retry per scene."""
+    model_name = 'Kling v2' if mode == 'premium' else 'Hailuo 2.3'
+    log(f"[3/6] Animating {len(scenes)} scenes ({model_name})...")
 
     paths = []
     for i, (img_path, scene) in enumerate(zip(image_paths, scenes)):
         out_path = os.path.join(output_dir, f"{slug}_anim_{i+1}.mp4")
-        log(f"  Animating scene {i+1}/{len(scenes)}... (this takes 1-3 min)")
-        animate_scene(img_path, scene.get("motion_prompt", ""), fal_key, out_path, mode)
-        log(f"  Scene {i+1}/{len(scenes)} animated.")
+
+        # Skip if already generated (cache from previous attempt)
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            log(f"  Scene {i+1}/{len(scenes)} cached, skipping.")
+            paths.append(out_path)
+            continue
+
+        last_error = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                log(f"  Animating scene {i+1}/{len(scenes)}... (attempt {attempt}, ~1-5 min)")
+                animate_scene(img_path, scene.get("motion_prompt", ""), fal_key, out_path, mode)
+                log(f"  Scene {i+1}/{len(scenes)} animated.")
+                last_error = None
+                break
+            except Exception as e:
+                last_error = e
+                log(f"  Scene {i+1} attempt {attempt} failed: {e}")
+                if attempt < max_retries:
+                    log(f"  Retrying scene {i+1}...")
+                    import time
+                    time.sleep(5)
+
+        if last_error:
+            raise Exception(f"Scene {i+1} animation failed after {max_retries} attempts: {last_error}")
+
         paths.append(out_path)
 
     return paths
@@ -464,8 +489,11 @@ def generate_cartoon_video(
     )
 
     # ── Step 4: Generate subtitles ──
-    log("[4/6] Generating TikTok-style subtitles...")
-    generate_tiktok_subs(audio_path, subs_path, max_words=3)
+    if not _exists(subs_path):
+        log("[4/6] Generating TikTok-style subtitles...")
+        generate_tiktok_subs(audio_path, subs_path, max_words=3)
+    else:
+        log("[4/6] Subtitles cached, skipping.")
 
     # ── Step 5: Skip (reserved) ──
     log("[5/6] Preparing assembly...")

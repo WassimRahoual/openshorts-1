@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
 from reddit import fetch_reddit_feed, download_reddit_video, DEFAULT_SUBREDDITS
 from reddit_ranking import compile_ranking
+import database as db
 
 load_dotenv()
 
@@ -176,6 +177,9 @@ async def run_job_wrapper(job_id):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Initialize database
+    db.init_db()
+    print("📦 Clip Library database initialized.")
     # Start worker and cleanup
     worker_task = asyncio.create_task(process_queue())
     cleanup_task = asyncio.create_task(cleanup_jobs())
@@ -196,7 +200,10 @@ app.add_middleware(
 # Custom video endpoint with proper range-request support (fixes Content-Length mismatch)
 @app.get("/videos/{job_id}/{filename}")
 async def serve_video(job_id: str, filename: str, request: Request):
+    # Check output dir first, then library dir
     file_path = os.path.join(OUTPUT_DIR, job_id, filename)
+    if not os.path.exists(file_path):
+        file_path = os.path.join(db.LIBRARY_DIR, job_id, filename)
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="Video not found")
     file_size = os.path.getsize(file_path)
@@ -264,15 +271,150 @@ def enqueue_output(out, job_id):
     finally:
         out.close()
 
+def _extract_youtube_id(url: str) -> str:
+    """Extract YouTube video ID from URL."""
+    if not url:
+        return None
+    import re
+    patterns = [
+        r'(?:v=|/v/|youtu\.be/|/embed/)([a-zA-Z0-9_-]{11})',
+    ]
+    for p in patterns:
+        m = re.search(p, url)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _save_job_to_library(job_id: str, job_data: dict, clips: list, metadata: dict, cost_analysis: dict):
+    """Persist job results to the clip library database."""
+    try:
+        job_start = job_data.get('start_time', time.time())
+        duration_secs = time.time() - job_start
+        source_url = job_data.get('source_url', '')
+        youtube_id = _extract_youtube_id(source_url)
+        mode = job_data.get('mode', 'ranking')
+        gemini_model = job_data.get('env', {}).get('GEMINI_MODEL', 'gemini-2.0-flash')
+
+        video_title = metadata.get('video_title_for_youtube_short', 'Untitled')
+        video_duration = metadata.get('video_duration')
+
+        # Upsert video
+        video_id = db.upsert_video(
+            youtube_id=youtube_id,
+            url=source_url,
+            title=video_title,
+            duration=video_duration,
+        )
+
+        # Save each clip to library
+        output_dir = job_data.get('output_dir', '')
+        saved_count = 0
+        for i, clip in enumerate(clips):
+            clip_url = clip.get('video_url', '')
+            # Extract filename from URL like /videos/{job_id}/filename.mp4
+            parts = clip_url.split('/')
+            if len(parts) >= 3:
+                clip_filename = parts[-1]
+            else:
+                continue
+
+            from urllib.parse import unquote
+            clip_filename = unquote(clip_filename)
+            src_path = os.path.join(output_dir, clip_filename)
+            if not os.path.exists(src_path):
+                continue
+
+            # Copy to persistent library directory
+            lib_subdir = os.path.join(db.LIBRARY_DIR, job_id)
+            os.makedirs(lib_subdir, exist_ok=True)
+            dst_path = os.path.join(lib_subdir, clip_filename)
+            if not os.path.exists(dst_path):
+                shutil.copy2(src_path, dst_path)
+
+            db.save_clip(
+                video_id=video_id,
+                job_id=job_id,
+                file_path=dst_path,
+                file_name=clip_filename,
+                start_time=clip.get('start'),
+                end_time=clip.get('end'),
+                rank=clip.get('rank', i + 1),
+                title=clip.get('video_title_for_youtube_short', clip.get('ranking_title', '')),
+                description=clip.get('video_description_for_tiktok', ''),
+                hashtags=clip.get('hashtags_tiktok', ''),
+                hook_text=clip.get('viral_hook_text', ''),
+                mode=mode,
+                gemini_model=gemini_model,
+            )
+            saved_count += 1
+
+        # Save job record
+        db.save_job(job_id, video_id=video_id, mode=mode, status='completed', gemini_model=gemini_model)
+        db.complete_job(
+            job_id,
+            status='completed',
+            clip_count=saved_count,
+            input_tokens=cost_analysis.get('input_tokens') if cost_analysis else None,
+            output_tokens=cost_analysis.get('output_tokens') if cost_analysis else None,
+            total_cost=cost_analysis.get('total_cost') if cost_analysis else None,
+            duration_secs=duration_secs,
+        )
+        # Save analysis data (scenes, transcript, Gemini response)
+        analysis_files = glob.glob(os.path.join(output_dir, "*_analysis.json"))
+        if analysis_files:
+            try:
+                with open(analysis_files[0], 'r') as f:
+                    analysis = json.load(f)
+
+                # Save transcript
+                transcript_data = analysis.get('transcript', {})
+                if transcript_data.get('text'):
+                    db.save_transcript(
+                        video_id=video_id,
+                        full_text=transcript_data['text'] if isinstance(transcript_data['text'], str) else json.dumps(transcript_data['text']),
+                        segments=json.dumps(transcript_data.get('segments', [])),
+                    )
+
+                # Save scenes
+                scenes = analysis.get('scenes', [])
+                if scenes:
+                    db.save_scenes(video_id=video_id, scenes=scenes)
+
+                # Save Gemini analysis
+                cost = analysis.get('cost_analysis') or {}
+                db.save_analysis(
+                    video_id=video_id,
+                    job_id=job_id,
+                    mode=analysis.get('mode'),
+                    gemini_model=analysis.get('gemini_model'),
+                    raw_response=json.dumps(analysis.get('gemini_response', [])),
+                    parsed_json=json.dumps(analysis.get('gemini_response', [])),
+                    scene_count=len(scenes),
+                    clip_count=saved_count,
+                    input_tokens=cost.get('input_tokens'),
+                    output_tokens=cost.get('output_tokens'),
+                    total_cost=cost.get('total_cost'),
+                )
+                print(f"📊 Saved analysis data: {len(scenes)} scenes, transcript, Gemini response")
+            except Exception as ae:
+                print(f"⚠️ Analysis save error: {ae}")
+
+        print(f"📦 Saved {saved_count} clips to library for job {job_id}")
+    except Exception as e:
+        print(f"⚠️ Library save error: {e}")
+
+
 async def run_job(job_id, job_data):
     """Executes the subprocess for a specific job."""
-    
+
     cmd = job_data['cmd']
     env = job_data['env']
     output_dir = job_data['output_dir']
-    
+
     jobs[job_id]['status'] = 'processing'
     jobs[job_id]['logs'].append("Job started by worker.")
+    jobs[job_id]['start_time'] = time.time()
     print(f"🎬 [run_job] Executing command for {job_id}: {' '.join(cmd)}")
     
     try:
@@ -319,7 +461,7 @@ async def run_job(job_id, job_data):
                                 fname = os.path.basename(rf)
                                 ready_clips.append({
                                     'video_url': f"/videos/{job_id}/{quote(fname)}",
-                                    'video_title_for_youtube_short': data.get('video_title_for_youtube_short', f'Ranking Short #{i+1}'),
+                                    'video_title_for_youtube_short': data.get('video_title_for_youtube_short', f'TOP 5 #{i+1}'),
                                     'video_description_for_tiktok': data.get('video_description_for_tiktok', ''),
                                     'video_description_for_instagram': data.get('video_description_for_instagram', ''),
                                     'hashtags_tiktok': data.get('hashtags_tiktok', ''),
@@ -372,7 +514,7 @@ async def run_job(job_id, job_data):
                         fname = os.path.basename(rf)
                         clips.append({
                             'video_url': f"/videos/{job_id}/{quote(fname)}",
-                            'video_title_for_youtube_short': data.get('video_title_for_youtube_short', f'Ranking Short #{i+1}'),
+                            'video_title_for_youtube_short': data.get('video_title_for_youtube_short', f'TOP 5 #{i+1}'),
                             'video_description_for_tiktok': data.get('video_description_for_tiktok', ''),
                             'video_description_for_instagram': data.get('video_description_for_instagram', ''),
                             'hashtags_tiktok': data.get('hashtags_tiktok', ''),
@@ -385,18 +527,30 @@ async def run_job(job_id, job_data):
                         clip['video_url'] = f"/videos/{job_id}/{quote(clip_filename)}"
 
                 jobs[job_id]['result'] = {'clips': clips, 'cost_analysis': cost_analysis}
-
                 jobs[job_id]['status'] = 'completed'
+
+                # Persist to clip library
+                loop = asyncio.get_event_loop()
+                loop.run_in_executor(None, _save_job_to_library, job_id, jobs[job_id], clips, data, cost_analysis)
             else:
                 jobs[job_id]['status'] = 'failed'
                 jobs[job_id]['logs'].append("No metadata file generated.")
+                db.save_job(job_id, mode=jobs[job_id].get('mode'), status='failed')
+                db.complete_job(job_id, status='failed', error="No metadata file generated.")
         else:
             jobs[job_id]['status'] = 'failed'
             jobs[job_id]['logs'].append(f"Process failed with exit code {returncode}")
-            
+            db.save_job(job_id, mode=jobs[job_id].get('mode'), status='failed')
+            db.complete_job(job_id, status='failed', error=f"Exit code {returncode}")
+
     except Exception as e:
         jobs[job_id]['status'] = 'failed'
         jobs[job_id]['logs'].append(f"Execution error: {str(e)}")
+        try:
+            db.save_job(job_id, mode=jobs[job_id].get('mode'), status='failed')
+            db.complete_job(job_id, status='failed', error=str(e))
+        except Exception:
+            pass
 
 @app.post("/api/process")
 async def process_endpoint(
@@ -430,7 +584,7 @@ async def process_endpoint(
     cmd = ["python", "-u", "main.py"] # -u for unbuffered
     env = os.environ.copy()
     env["GEMINI_API_KEY"] = api_key # Override with key from request
-    gemini_model = request.headers.get("X-Gemini-Model", "gemini-2.5-flash")
+    gemini_model = request.headers.get("X-Gemini-Model", "gemini-2.0-flash")
     env["GEMINI_MODEL"] = gemini_model
     
     if url:
@@ -467,6 +621,7 @@ async def process_endpoint(
         'env': env,
         'output_dir': job_output_dir,
         'mode': mode,
+        'source_url': url or '',
     }
     
     await job_queue.put(job_id)
@@ -2217,6 +2372,98 @@ async def saasshorts_voices(
         ],
         "source": "defaults",
     }
+
+
+# ── Clip Library Endpoints ───────────────────────────────────────────
+
+@app.get("/api/library/stats")
+async def library_stats():
+    """Get library statistics."""
+    return db.get_library_stats()
+
+
+@app.get("/api/library/videos")
+async def library_videos(limit: int = 50, offset: int = 0):
+    """List all source videos in library."""
+    return db.list_videos(limit=limit, offset=offset)
+
+
+@app.get("/api/library/clips")
+async def library_clips(
+    video_id: Optional[int] = None,
+    favorite: Optional[bool] = None,
+    search: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+):
+    """List clips with optional filtering."""
+    clips = db.list_clips(
+        video_id=video_id,
+        favorite_only=bool(favorite),
+        search=search,
+        limit=limit,
+        offset=offset,
+    )
+    # Add serving URL for each clip
+    for clip in clips:
+        clip["serving_url"] = f"/videos/{clip['job_id']}/{quote(clip['file_name'])}"
+    return clips
+
+
+@app.get("/api/library/clips/{clip_id}")
+async def library_clip_detail(clip_id: int):
+    """Get single clip details."""
+    clip = db.get_clip(clip_id)
+    if not clip:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    clip["serving_url"] = f"/videos/{clip['job_id']}/{quote(clip['file_name'])}"
+    return clip
+
+
+@app.post("/api/library/clips/{clip_id}/favorite")
+async def library_toggle_favorite(clip_id: int):
+    """Toggle favorite status for a clip."""
+    new_state = db.toggle_favorite(clip_id)
+    return {"favorite": new_state}
+
+
+@app.delete("/api/library/clips/{clip_id}")
+async def library_delete_clip(clip_id: int):
+    """Delete a clip from the library."""
+    success = db.delete_clip(clip_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    return {"deleted": True}
+
+
+@app.get("/api/library/jobs")
+async def library_jobs(limit: int = 50, offset: int = 0):
+    """List job history."""
+    return db.list_jobs(limit=limit, offset=offset)
+
+
+@app.get("/api/library/videos/{video_id}/scenes")
+async def library_video_scenes(video_id: int, include_junk: bool = False):
+    """Get cached scenes for a video."""
+    scenes = db.get_scenes(video_id, include_junk=include_junk)
+    if not scenes:
+        raise HTTPException(status_code=404, detail="No scenes found for this video")
+    return scenes
+
+
+@app.get("/api/library/videos/{video_id}/analyses")
+async def library_video_analyses(video_id: int):
+    """Get Gemini analyses for a video."""
+    return db.list_analyses(video_id=video_id)
+
+
+@app.get("/api/library/videos/{video_id}/transcript")
+async def library_video_transcript(video_id: int):
+    """Get cached transcript for a video."""
+    transcript = db.get_transcript(video_id)
+    if not transcript:
+        raise HTTPException(status_code=404, detail="No transcript found for this video")
+    return transcript
 
 
 # ── Cartoon Stories Endpoints ─────────────────────────────────────────

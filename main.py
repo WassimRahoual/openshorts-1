@@ -1093,7 +1093,7 @@ def get_viral_clips(transcript_result, video_duration):
 
     client = genai.Client(api_key=api_key)
     
-    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
     
     print(f"🤖  Initializing Gemini with model: {model_name}")
 
@@ -1113,40 +1113,61 @@ def get_viral_clips(transcript_result, video_duration):
         words_json=json.dumps(words)
     )
 
+    # Fallback chain: if quota exceeded, try next model
+    FALLBACK_CHAIN = {
+        "gemini-2.5-pro": "gemini-2.5-flash",
+        "gemini-2.5-flash": "gemini-2.0-flash",
+    }
+    models_to_try = [model_name]
+    current = model_name
+    while current in FALLBACK_CHAIN:
+        current = FALLBACK_CHAIN[current]
+        models_to_try.append(current)
+
+    response = None
+    used_model = model_name
+    for try_model in models_to_try:
+        try:
+            if try_model != models_to_try[0]:
+                print(f"   🔄 Retrying with fallback model: {try_model}...")
+            response = client.models.generate_content(model=try_model, contents=prompt)
+            used_model = try_model
+            break
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                print(f"   ⚠️ Quota exceeded for {try_model}")
+                if try_model == models_to_try[-1]:
+                    raise
+                continue
+            else:
+                raise
+
     try:
-        response = client.models.generate_content(
-            model=model_name,
-            contents=prompt
-        )
-        
         # --- Cost Calculation ---
         try:
             usage = response.usage_metadata
             if usage:
-                # Gemini 2.5 Flash Pricing (Dec 2025)
-                # Input: $0.10 per 1M tokens
-                # Output: $0.40 per 1M tokens
-                
                 input_price_per_million = 0.10
                 output_price_per_million = 0.40
-                
+
                 prompt_tokens = usage.prompt_token_count
                 output_tokens = usage.candidates_token_count
-                
+
                 input_cost = (prompt_tokens / 1_000_000) * input_price_per_million
                 output_cost = (output_tokens / 1_000_000) * output_price_per_million
                 total_cost = input_cost + output_cost
-                
+
                 cost_analysis = {
                     "input_tokens": prompt_tokens,
                     "output_tokens": output_tokens,
                     "input_cost": input_cost,
                     "output_cost": output_cost,
                     "total_cost": total_cost,
-                    "model": model_name
+                    "model": used_model
                 }
 
-                print(f"💰 Token Usage ({model_name}):")
+                print(f"💰 Token Usage ({used_model}):")
                 print(f"   - Input Tokens: {prompt_tokens} (${input_cost:.6f})")
                 print(f"   - Output Tokens: {output_tokens} (${output_cost:.6f})")
                 print(f"   - Total Estimated Cost: ${total_cost:.6f}")
@@ -1180,7 +1201,7 @@ def get_ranking_clips(transcript_result, video_duration, num_clips=6, scene_boun
     not just read the transcript. This is critical for compilation videos
     where the transcript is mostly reactions/noise.
     """
-    print(f"🏆 Analyzing with Gemini Vision (Ranking mode, TOP {num_clips})...")
+    print(f"🏆 Analyzing with Gemini Vision (Ranking mode, selecting {num_clips} best clips)...")
 
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -1188,7 +1209,7 @@ def get_ranking_clips(transcript_result, video_duration, num_clips=6, scene_boun
         return None
 
     client = genai.Client(api_key=api_key)
-    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
     words = []
     for segment in transcript_result['segments']:
@@ -1254,15 +1275,40 @@ def get_ranking_clips(transcript_result, video_duration, num_clips=6, scene_boun
             words_json=json.dumps(words)
         )
 
-    try:
-        # Send video + prompt to Gemini (video first for best results)
-        if uploaded_file:
-            print(f"   🎬 Sending video + prompt to Gemini Vision...")
-            contents = [uploaded_file, prompt]
-        else:
-            contents = prompt
-        response = client.models.generate_content(model=model_name, contents=contents)
+    # Fallback chain: if quota exceeded, try next model
+    FALLBACK_CHAIN = {
+        "gemini-2.5-pro": "gemini-2.5-flash",
+        "gemini-2.5-flash": "gemini-2.0-flash",
+    }
+    models_to_try = [model_name]
+    current = model_name
+    while current in FALLBACK_CHAIN:
+        current = FALLBACK_CHAIN[current]
+        models_to_try.append(current)
 
+    response = None
+    used_model = model_name
+    for try_model in models_to_try:
+        try:
+            if try_model != models_to_try[0]:
+                print(f"   🔄 Retrying with fallback model: {try_model}...")
+            print(f"   🎬 Sending {'video + prompt' if uploaded_file else 'prompt'} to Gemini ({try_model})...")
+            contents = [uploaded_file, prompt] if uploaded_file else prompt
+            response = client.models.generate_content(model=try_model, contents=contents)
+            used_model = try_model
+            break
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                print(f"   ⚠️ Quota exceeded for {try_model}")
+                if try_model == models_to_try[-1]:
+                    raise
+                continue
+            else:
+                raise
+
+    try:
+        cost_analysis = None
         try:
             usage = response.usage_metadata
             if usage:
@@ -1275,11 +1321,11 @@ def get_ranking_clips(transcript_result, video_duration, num_clips=6, scene_boun
                 cost_analysis = {
                     "input_tokens": prompt_tokens, "output_tokens": output_tokens,
                     "input_cost": input_cost, "output_cost": output_cost,
-                    "total_cost": input_cost + output_cost, "model": model_name
+                    "total_cost": input_cost + output_cost, "model": used_model
                 }
-                print(f"💰 Total cost: ${cost_analysis['total_cost']:.6f}")
+                print(f"💰 Total cost: ${cost_analysis['total_cost']:.6f} (model: {used_model})")
         except Exception:
-            cost_analysis = None
+            pass
 
         text = response.text
         if text.startswith("```json"):
@@ -1403,7 +1449,7 @@ def refine_ranking_titles_with_frames(video_path, clips, api_key):
     print(f"   🎯 Refining {len(clips)} ranking titles with frame extraction...")
 
     client = genai.Client(api_key=api_key)
-    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -1474,7 +1520,30 @@ def refine_ranking_titles_with_frames(video_path, clips, api_key):
                 contents.append(img)
         contents.append(prompt)
 
-        response = client.models.generate_content(model=model_name, contents=contents)
+        # Fallback chain for title refinement
+        FALLBACK_CHAIN = {"gemini-2.5-pro": "gemini-2.5-flash", "gemini-2.5-flash": "gemini-2.0-flash"}
+        models_to_try = [model_name]
+        cur = model_name
+        while cur in FALLBACK_CHAIN:
+            cur = FALLBACK_CHAIN[cur]
+            models_to_try.append(cur)
+
+        response = None
+        for try_model in models_to_try:
+            try:
+                if try_model != models_to_try[0]:
+                    print(f"   🔄 Title refinement: retrying with {try_model}...")
+                response = client.models.generate_content(model=try_model, contents=contents)
+                break
+            except Exception as e2:
+                if "429" in str(e2) or "RESOURCE_EXHAUSTED" in str(e2):
+                    print(f"   ⚠️ Quota exceeded for {try_model}")
+                    if try_model == models_to_try[-1]:
+                        raise
+                    continue
+                else:
+                    raise
+
         text = response.text
         if text.startswith("```json"):
             text = text[7:]
@@ -1519,19 +1588,40 @@ def get_short_metadata(transcript_result, video_duration):
         return None
 
     client = genai.Client(api_key=api_key)
-    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
     prompt = GEMINI_SHORT_PROMPT_TEMPLATE.format(
         video_duration=round(video_duration, 3),
         transcript_text=json.dumps(transcript_result['text']),
     )
 
-    try:
-        response = client.models.generate_content(
-            model=model_name,
-            contents=prompt
-        )
+    # Fallback chain
+    FALLBACK_CHAIN = {"gemini-2.5-pro": "gemini-2.5-flash", "gemini-2.5-flash": "gemini-2.0-flash"}
+    models_to_try = [model_name]
+    cur = model_name
+    while cur in FALLBACK_CHAIN:
+        cur = FALLBACK_CHAIN[cur]
+        models_to_try.append(cur)
 
+    response = None
+    used_model = model_name
+    for try_model in models_to_try:
+        try:
+            if try_model != models_to_try[0]:
+                print(f"   🔄 Retrying with fallback model: {try_model}...")
+            response = client.models.generate_content(model=try_model, contents=prompt)
+            used_model = try_model
+            break
+        except Exception as e:
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                print(f"   ⚠️ Quota exceeded for {try_model}")
+                if try_model == models_to_try[-1]:
+                    raise
+                continue
+            else:
+                raise
+
+    try:
         # Cost calculation
         cost_analysis = None
         try:
@@ -1550,9 +1640,9 @@ def get_short_metadata(transcript_result, video_duration):
                     "input_cost": input_cost,
                     "output_cost": output_cost,
                     "total_cost": total_cost,
-                    "model": model_name
+                    "model": used_model
                 }
-                print(f"💰 Token Usage ({model_name}): ${total_cost:.6f}")
+                print(f"💰 Token Usage ({used_model}): ${total_cost:.6f}")
         except Exception as e:
             print(f"⚠️ Could not calculate cost: {e}")
 
@@ -1766,6 +1856,23 @@ if __name__ == '__main__':
                 clips_data['shorts'] = clips_data['shorts'][:1]
                 print(f"🎯 Normal mode: keeping only the best clip.")
 
+            # Save analysis data for library persistence
+            analysis_data = {
+                "video_title": video_title,
+                "video_duration": duration,
+                "source_url": args.url or "",
+                "mode": args.mode,
+                "gemini_model": os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+                "transcript": {"text": transcript.get("text", ""), "segments": transcript.get("segments", [])},
+                "scenes": [(s, e) for s, e in scene_bounds] if args.mode == 'ranking' and scene_bounds else [],
+                "gemini_response": clips_data.get("shorts", []),
+                "cost_analysis": clips_data.get("cost_analysis"),
+            }
+            analysis_file = os.path.join(output_dir, f"{video_title}_analysis.json")
+            with open(analysis_file, 'w') as f:
+                json.dump(analysis_data, f, indent=2)
+            print(f"   📊 Saved analysis to {analysis_file}")
+
             # Save metadata
             clips_data['transcript'] = transcript
             metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
@@ -1836,6 +1943,16 @@ if __name__ == '__main__':
                     if len(batch) >= 3:  # need at least 3 clips for a ranking
                         batches.append(batch)
 
+                # Reassign local ranks and titles per batch for consistency
+                # Each batch becomes its own TOP N (e.g. TOP 5 → TOP 1)
+                for batch_idx, batch in enumerate(batches):
+                    batch_size = len(batch)
+                    for i, clip in enumerate(batch):
+                        local_rank = batch_size - i  # first clip = highest rank, last = #1
+                        clip['_local_rank'] = local_rank
+                        clip['rank'] = local_rank
+                    print(f"   📋 Batch {batch_idx+1}: TOP {batch_size} → TOP 1 ({batch_size} clips)")
+
                 print(f"\n🎬 === Generating {len(batches)} Ranking Short(s) from {len(all_shorts)} clips ===")
 
                 # --- PARALLEL CLIP PROCESSING ---
@@ -1844,8 +1961,6 @@ if __name__ == '__main__':
                 # Collect ALL clips across all batches for parallel processing
                 all_clip_jobs = []  # (batch_idx, local_i, clip, seg_temp, seg_vertical)
                 for batch_idx, batch in enumerate(batches):
-                    for i, clip in enumerate(batch):
-                        clip['_local_rank'] = len(batch) - i
                     for local_i, clip in enumerate(batch):
                         seg_filename = f"temp_seg_{batch_idx}_{local_i}.mp4"
                         seg_temp = os.path.join(output_dir, f"temp_raw_{seg_filename}")

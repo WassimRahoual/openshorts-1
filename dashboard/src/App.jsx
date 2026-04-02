@@ -10,6 +10,7 @@ import SaaShortsTab from './components/SaaShortsTab';
 import UGCGallery from './components/UGCGallery';
 import RedditFeed from './components/RedditFeed';
 import CartoonStoriesTab from './components/CartoonStoriesTab';
+import ClipLibrary from './components/ClipLibrary';
 import { getApiUrl } from './config';
 
 // Enhanced "Encryption" using XOR + Base64 with a Salt
@@ -170,7 +171,7 @@ function App() {
 
   const [sessionRecovered, setSessionRecovered] = useState(false);
   const [mode, setMode] = useState('ranking'); // 'normal' | 'ranking'
-  const [geminiModel, setGeminiModel] = useState(() => localStorage.getItem('gemini_model') || 'gemini-2.5-flash');
+  const [geminiModel, setGeminiModel] = useState(() => localStorage.getItem('gemini_model') || 'gemini-2.0-flash');
 
   // Sync state for original video playback
   const [syncedTime, setSyncedTime] = useState(0);
@@ -452,6 +453,14 @@ function App() {
         >
           <LayoutDashboard size={20} />
           <span className="font-medium hidden lg:block">Clip Generator</span>
+        </button>
+
+        <button
+          onClick={() => setActiveTab('library')}
+          className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'library' ? 'bg-emerald-500/10 text-emerald-400' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
+        >
+          <History size={20} />
+          <span className="font-medium hidden lg:block">Clip Library</span>
         </button>
 
         <button
@@ -817,6 +826,11 @@ function App() {
           {/* View: Cartoon Stories */}
           {activeTab === 'cartoon' && (
             <CartoonStoriesTab geminiApiKey={apiKey} elevenLabsKey={elevenLabsKey} falKey={falKey} />
+          )}
+
+          {/* View: Clip Library */}
+          {activeTab === 'library' && (
+            <ClipLibrary />
           )}
 
           {/* View: UGC Gallery */}

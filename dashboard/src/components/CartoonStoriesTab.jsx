@@ -66,7 +66,7 @@ export default function CartoonStoriesTab({ geminiApiKey, elevenLabsKey, falKey 
   // Fetch voices on mount
   useEffect(() => {
     if (!elevenLabsKey) return;
-    fetch(`${getApiUrl()}/api/saasshorts/voices`, {
+    fetch(getApiUrl('/api/saasshorts/voices'), {
       headers: { 'X-ElevenLabs-Key': elevenLabsKey },
     })
       .then(r => r.json())
@@ -82,7 +82,7 @@ export default function CartoonStoriesTab({ geminiApiKey, elevenLabsKey, falKey 
     if (!jobId || genStatus === 'completed' || genStatus === 'failed') return;
     const interval = setInterval(async () => {
       try {
-        const resp = await fetch(`${getApiUrl()}/api/cartoon/status/${jobId}`);
+        const resp = await fetch(getApiUrl(`/api/cartoon/status/${jobId}`));
         const data = await resp.json();
         setLogs(data.logs || []);
         setGenStatus(data.status);
@@ -105,7 +105,7 @@ export default function CartoonStoriesTab({ geminiApiKey, elevenLabsKey, falKey 
     setLoading(true);
     setError('');
     try {
-      const resp = await fetch(`${getApiUrl()}/api/cartoon/story`, {
+      const resp = await fetch(getApiUrl('/api/cartoon/story'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Gemini-Key': geminiApiKey },
         body: JSON.stringify({ topic, genre, style, language, num_scenes: numScenes }),
@@ -134,7 +134,7 @@ export default function CartoonStoriesTab({ geminiApiKey, elevenLabsKey, falKey 
     const storyToSend = { ...story, full_narration: editedNarration };
 
     try {
-      const resp = await fetch(`${getApiUrl()}/api/cartoon/generate`, {
+      const resp = await fetch(getApiUrl('/api/cartoon/generate'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -439,7 +439,7 @@ export default function CartoonStoriesTab({ geminiApiKey, elevenLabsKey, falKey 
 
             <div className="bg-zinc-800/50 border border-zinc-700/30 rounded-xl overflow-hidden">
               <video
-                src={`${getApiUrl()}${result.video_url}`}
+                src={getApiUrl(result.video_url)}
                 controls
                 autoPlay
                 className="w-full max-h-[70vh] bg-black"
@@ -448,7 +448,7 @@ export default function CartoonStoriesTab({ geminiApiKey, elevenLabsKey, falKey 
 
             <div className="flex gap-3">
               <a
-                href={`${getApiUrl()}${result.video_url}`}
+                href={getApiUrl(result.video_url)}
                 download
                 className="flex-1 py-3 rounded-xl font-semibold text-white bg-gradient-to-r from-purple-600 to-pink-600 flex items-center justify-center gap-2"
               >
